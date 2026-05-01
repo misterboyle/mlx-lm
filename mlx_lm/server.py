@@ -1360,12 +1360,14 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            choice[key_name] = {
-                "role": "assistant",
-                "content": text,
-                "reasoning": reasoning_text,
-                "tool_calls": tool_calls,
-            }
+            delta: dict[str, any] = {"role": "assistant"}
+            if text:
+                delta["content"] = text
+            if reasoning_text:
+                delta["reasoning_content"] = reasoning_text
+            if tool_calls:
+                delta["tool_calls"] = tool_calls
+            choice[key_name] = delta
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
@@ -1569,7 +1571,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment or tool_calls or (reasoning_text and not in_reasoning):
+                elif segment or reasoning_text or tool_calls:
                     response = self.generate_response(
                         segment,
                         None,
