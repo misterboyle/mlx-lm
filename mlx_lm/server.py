@@ -1569,7 +1569,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment or tool_calls or reasoning_text:
+                elif segment or tool_calls or (reasoning_text and not in_reasoning):
                     response = self.generate_response(
                         segment,
                         None,
