@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {},
+  "instructions": [
+    "README.md",
+    "AGENTS.md"
+  ],
+  "permission": {
+    "edit": {
+      "mlx_lm.egg-info/*": "deny",
+    },
+  },
+  "tools": {
+    "github-triage": false,
+    "github-pr-search": false,
+  },
+}
