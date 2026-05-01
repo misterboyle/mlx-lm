@@ -42,7 +42,7 @@ setup(
     ],
     python_requires=">=3.8",
     extras_require={
-        "test": ["datasets", "lm-eval"],
+        "test": ["datasets", "lm-eval", "requests"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],

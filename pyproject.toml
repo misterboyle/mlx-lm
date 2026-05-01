@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "mlx-lm"
+dynamic = ["version"]
+description = "LLMs with MLX and the Hugging Face Hub"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "mlx>=0.30.4; platform_system == 'Darwin'",
+    "numpy",
+    "transformers>=5.0.0",
+    "sentencepiece",
+    "protobuf",
+    "pyyaml",
+    "jinja2",
+]
+
+[project.optional-dependencies]
+test = ["datasets", "lm-eval", "requests"]
+train = ["datasets", "tqdm"]
+evaluate = ["lm-eval", "tqdm"]
+cuda13 = ["mlx[cuda13]>=0.30.4"]
+cuda12 = ["mlx[cuda12]>=0.30.4"]
+cpu = ["mlx[cpu]>=0.30.4"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"

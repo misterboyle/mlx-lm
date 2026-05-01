@@ -1,6 +1,18 @@
 - The default branch is `feature/turboquant-kv-cache` (30 commits with all TurboQuant work). `main` only has 2 commits and is not the active branch.
 - Prefer automation: execute requested actions without confirmation unless blocked by missing info or safety/irreversibility.
 
+## Development Setup
+
+Use a Python 3.14+ venv in the repo root:
+
+```bash
+python3.14 -m venv venv
+source venv/bin/activate
+pip install -e ".[test]"
+```
+
+The venv directory (`venv/`) is gitignored. Always activate before running tests or the server.
+
 ## Style Guide
 
 ### General Principles
@@ -49,7 +61,7 @@ Order (strict, observed across all modules):
 
 ## Testing
 
-- Run `python -m unittest discover tests/ -v` from the repo root.
+- Run `python -m unittest discover tests/ -v` from the repo root (venv must be activated).
 - TurboQuant tests are in `tests/test_turboquant.py` (668 lines, 8 test classes).
 - Tests use `unittest.TestCase` — NOT pytest-style.
 - Test model: `mlx-community/Qwen1.5-0.5B-Chat-4bit` (loaded once in `setUpClass`).
