@@ -32,7 +32,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, generation_stream, stream_generate
+from .generate import BatchGenerator, get_generation_stream, stream_generate
 from .models.cache import (
     LRUPromptCache,
     can_trim_prompt_cache,
@@ -336,7 +336,7 @@ class TimeBudget:
             self._loops += 1
             self._time_spent += time.time() - self._start
             if self._loops % self._sync_frequency == 0:
-                with mx.stream(generation_stream):
+                with mx.stream(get_generation_stream()):
                     loop_time = mx.distributed.all_sum(self._time_spent).item()
                 avg_loop_time = loop_time / (
                     mx.distributed.init().size() * self._sync_frequency
@@ -553,7 +553,7 @@ class ResponseGenerator:
         if not self._is_distributed:
             return obj
 
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             if self._rank == 0:
                 if obj is None:
                     mx.eval(mx.distributed.all_sum(0))
@@ -859,7 +859,7 @@ class ResponseGenerator:
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
-                    with mx.stream(generation_stream):
+                    with mx.stream(get_generation_stream()):
                         caches = batch_generator.remove(
                             uids_to_remove, return_prompt_caches=True
                         )

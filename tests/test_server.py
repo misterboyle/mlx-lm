@@ -3,63 +3,130 @@
 import http
 import io
 import json
+import multiprocessing
+import socket
 import threading
+import time
 import unittest
 
-import mlx.core as mx
 import requests
 
+import mlx.core as mx
+
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
-from mlx_lm.utils import load
+from mlx_lm.server import LRUPromptCache
 
 
-class DummyModelProvider:
+def _server_process(with_draft, ready_queue):
+    """Run the server in a separate process with its own MLX context.
+
+    MLX streams are thread-affine, so model loading and generation must
+    happen on the same thread (the subprocess main thread). The HTTP server
+    runs on a background thread.
+    """
+    import mlx.core as mx
+    from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+    from mlx_lm.utils import load
+
+    HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+    model, tokenizer = load(HF_MODEL_PATH)
+
+    cli_args = type(
+        "obj",
+        (object,),
+        {
+            "adapter_path": None,
+            "chat_template": None,
+            "use_default_chat_template": False,
+            "trust_remote_code": False,
+            "draft_model": None,
+            "num_draft_tokens": 3,
+            "temp": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "min_p": 0.0,
+            "max_tokens": 512,
+            "chat_template_args": {},
+            "model": None,
+            "decode_concurrency": 32,
+            "prompt_concurrency": 8,
+            "prefill_step_size": 2048,
+            "prompt_cache_size": 10,
+            "prompt_cache_bytes": 1 << 63,
+            "prompt_cache_total_bytes": None,
+            "allowed_origins": ["*"],
+        },
+    )
+
+    if with_draft:
+        draft_model, _ = load(HF_MODEL_PATH)
+        cli_args.draft_model = HF_MODEL_PATH
+    else:
+        draft_model = None
+
+    provider = type(
+        "Prov",
+        (object,),
+        {
+            "model": model,
+            "tokenizer": tokenizer,
+            "model_key": (HF_MODEL_PATH, None),
+            "draft_model": draft_model,
+            "draft_model_key": HF_MODEL_PATH if with_draft else None,
+            "is_batchable": True,
+            "cli_args": cli_args,
+            "load": lambda self, mn, adapter=None, dm=None: (model, tokenizer),
+        },
+    )()
+    cache = LRUPromptCache()
+    rg = ResponseGenerator(provider, cache)
+
+    # Find a free port
+    with socket.socket() as s:
+        s.bind(("localhost", 0))
+        port = s.getsockname()[1]
+
+    addr = ("localhost", port)
+    httpd = http.server.HTTPServer(
+        addr,
+        lambda *a, **kw: APIHandler(rg, *a, **kw),
+    )
+
+    # HTTP server runs on a background thread
+    http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    http_thread.start()
+
+    # Signal readiness
+    ready_queue.put(port)
+
+    # Generate loop runs on the subprocess main thread (same thread that
+    # loaded the model), matching the production architecture.
+    rg._generate()
+
+
+class _ServerFixture:
+    """Manages a server subprocess for tests."""
+
     def __init__(self, with_draft=False):
-        HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
-        self.model, self.tokenizer = load(HF_MODEL_PATH)
-        self.model_key = (HF_MODEL_PATH, None)
-        self.is_batchable = True
+        self.with_draft = with_draft
+        self.process = None
+        self.port = None
+        self.ready_queue = None
 
-        # Add draft model support
-        self.draft_model = None
-        self.draft_model_key = None
-        self.cli_args = type(
-            "obj",
-            (object,),
-            {
-                "adapter_path": None,
-                "chat_template": None,
-                "use_default_chat_template": False,
-                "trust_remote_code": False,
-                "draft_model": None,
-                "num_draft_tokens": 3,
-                "temp": 0.0,
-                "top_p": 1.0,
-                "top_k": 0,
-                "min_p": 0.0,
-                "max_tokens": 512,
-                "chat_template_args": {},
-                "model": None,
-                "decode_concurrency": 32,
-                "prompt_concurrency": 8,
-                "prefill_step_size": 2048,
-                "prompt_cache_size": 10,
-                "prompt_cache_bytes": 1 << 63,
-                "prompt_cache_total_bytes": None,
-                "allowed_origins": ["*"],
-            },
+    def start(self):
+        self.ready_queue = multiprocessing.Queue()
+        self.process = multiprocessing.Process(
+            target=_server_process,
+            args=(self.with_draft, self.ready_queue),
+            daemon=True,
         )
+        self.process.start()
+        self.port = self.ready_queue.get(timeout=120)
 
-        if with_draft:
-            # Use the same model as the draft model for testing
-            self.draft_model, _ = load(HF_MODEL_PATH)
-            self.draft_model_key = HF_MODEL_PATH
-            self.cli_args.draft_model = HF_MODEL_PATH
-
-    def load(self, model, adapter=None, draft_model=None):
-        assert model in ["default_model", "chat_model"]
-        return self.model, self.tokenizer
+    def stop(self):
+        if self.process and self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=10)
 
 
 class MockCache:
@@ -85,25 +152,13 @@ class MockCache:
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.response_generator = ResponseGenerator(
-            DummyModelProvider(), LRUPromptCache()
-        )
-        cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
-            cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
-        )
-        cls.port = cls.httpd.server_port
-        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
-        cls.server_thread.daemon = True
-        cls.server_thread.start()
+        cls._server = _ServerFixture(with_draft=False)
+        cls._server.start()
+        cls.port = cls._server.port
 
     @classmethod
     def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.server_thread.join()
-        cls.response_generator.stop_and_join()
+        cls._server.stop()
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -234,25 +289,13 @@ class TestServer(unittest.TestCase):
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.response_generator = ResponseGenerator(
-            DummyModelProvider(with_draft=True), LRUPromptCache()
-        )
-        cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
-            cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
-        )
-        cls.port = cls.httpd.server_port
-        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
-        cls.server_thread.daemon = True
-        cls.server_thread.start()
+        cls._server = _ServerFixture(with_draft=True)
+        cls._server.start()
+        cls.port = cls._server.port
 
     @classmethod
     def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.server_thread.join()
-        cls.response_generator.stop_and_join()
+        cls._server.stop()
 
     def test_handle_completions_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/completions"

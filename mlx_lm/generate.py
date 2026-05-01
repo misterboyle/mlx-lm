@@ -232,8 +232,17 @@ def setup_arg_parser():
     return parser
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+# A stream on the default device just for generation.
+# Created lazily per-thread so tests can run generation on a background
+# thread (MLX streams are thread-affine).
+_generation_stream = None
+
+
+def get_generation_stream():
+    global _generation_stream
+    if _generation_stream is None:
+        _generation_stream = mx.new_stream(mx.default_device())
+    return _generation_stream
 
 
 @contextlib.contextmanager
@@ -416,7 +425,7 @@ def generate_step(
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -441,7 +450,7 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(get_generation_stream()):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
@@ -565,7 +574,7 @@ def speculative_generate_step(
         return y, logprobs
 
     def _step(model, cache, y, n_predict=1):
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
@@ -613,7 +622,7 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
-    with mx.stream(generation_stream):
+    with mx.stream(get_generation_stream()):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
@@ -724,7 +733,7 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [get_generation_stream()]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
@@ -1012,7 +1021,7 @@ class BatchGenerator:
 
     def close(self):
         if self._old_wired_limit is not None:
-            mx.synchronize(generation_stream)
+            mx.synchronize(get_generation_stream())
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1349,7 +1358,7 @@ class BatchGenerator:
         return responses
 
     def next(self):
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             return self._next()
 
 
