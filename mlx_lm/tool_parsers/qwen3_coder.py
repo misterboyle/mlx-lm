@@ -80,13 +80,19 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
-    end_index = function_call_str.index(">")
+    try:
+        end_index = function_call_str.index(">")
+    except ValueError:
+        return None
     function_name = function_call_str[:end_index]
     param_config = _get_arguments_config(function_name, tools)
     parameters = function_call_str[end_index + 1 :]
     param_dict = {}
     for match_text in _parameter_regex.findall(parameters):
-        idx = match_text.index(">")
+        try:
+            idx = match_text.index(">")
+        except ValueError:
+            continue
         param_name = match_text[:idx]
         param_value = str(match_text[idx + 1 :])
         if param_value.startswith("\n"):
@@ -112,4 +118,7 @@ def parse_tool_call(
     match = _function_regex.findall(model_output)
     if not match:
         raise ValueError("No function provided.")
-    return _parse_xml_function_call(match[0], tools)
+    result = _parse_xml_function_call(match[0], tools)
+    if result is None:
+        raise ValueError("Malformed function call.")
+    return result
