@@ -179,6 +179,11 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
         _cache_mod.__dict__.setdefault("MixedQuantKVCache", MixedQuantKVCache)
     except ImportError:
         pass
+    try:
+        from mlx_lm.models.deepseek_v4 import SparseKVCache
+        _cache_mod.__dict__.setdefault("SparseKVCache", SparseKVCache)
+    except ImportError:
+        pass
 
     local_globals = _cache_mod.__dict__
 
@@ -188,7 +193,7 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
         "KVCache", "QuantizedKVCache", "RotatingKVCache",
         "CacheList", "BatchKVCache", "BatchRotatingKVCache",
         "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
-        "TurboQuantKVCache", "MixedQuantKVCache",
+        "TurboQuantKVCache", "MixedQuantKVCache", "SparseKVCache",
     }
     for c in classes:
         if c not in _ALLOWED_CACHE_CLASSES:
