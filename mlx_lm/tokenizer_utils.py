@@ -531,9 +531,18 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
+    except (ValueError, AttributeError, KeyError):
+        # Model type not recognized by transformers (e.g. deepseek_v4).
+        # Fall back to loading tokenizer directly from files.
+        from transformers import PreTrainedTokenizerFast
+
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 

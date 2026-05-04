@@ -22,6 +22,21 @@ from .cache import KVCache, RotatingKVCache, _BaseCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
+# Register with transformers so AutoTokenizer/AutoConfig work
+try:
+    from transformers import AutoConfig, PretrainedConfig
+
+    class _DeepseekV4Config(PretrainedConfig):
+        model_type = "deepseek_v4"
+
+        def __init__(self, **kw):
+            self.rope_scaling = kw.pop("rope_scaling", None)
+            super().__init__(**kw)
+
+    AutoConfig.register("deepseek_v4", _DeepseekV4Config)
+except Exception:
+    pass
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
