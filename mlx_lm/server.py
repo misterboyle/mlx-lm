@@ -50,6 +50,7 @@ def _maybe_dequantize_cache(cache):
     """
     from .models.cache import CacheList
     from .models.mixed_quant_cache import MixedQuantKVCache
+
     for i, c in enumerate(cache):
         if isinstance(c, MixedQuantKVCache):
             cache[i] = c.to_kvcache()
@@ -74,15 +75,14 @@ def _maybe_quantize_cache(cache, kv_quant_config, min_tokens=0):
     if kv_quant_config is None:
         return cache
     k_bits, v_bits = kv_quant_config
-    from .models.cache import KVCache, CacheList
+    from .models.cache import CacheList, KVCache
     from .models.mixed_quant_cache import MixedQuantKVCache
+
     for i, c in enumerate(cache):
         if isinstance(c, MixedQuantKVCache):
             continue
         if isinstance(c, KVCache) and c.offset >= max(min_tokens, 1):
-            cache[i] = MixedQuantKVCache.from_kvcache(
-                c, k_bits=k_bits, v_bits=v_bits
-            )
+            cache[i] = MixedQuantKVCache.from_kvcache(c, k_bits=k_bits, v_bits=v_bits)
         elif isinstance(c, CacheList):
             new_subs = list(c.caches)
             changed = False
@@ -506,9 +506,7 @@ class ResponseGenerator:
         self._kv_quant_config = getattr(
             model_provider.cli_args, "kv_quant_config", None
         )
-        self._kv_quant_start = getattr(
-            model_provider.cli_args, "quantized_kv_start", 0
-        )
+        self._kv_quant_start = getattr(model_provider.cli_args, "quantized_kv_start", 0)
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -888,12 +886,9 @@ class ResponseGenerator:
             # Save at the END of prefill -- cache offset matches key length
             # exactly (no off-by-one from generated tokens).
             # Also save periodic checkpoints during long prefills.
-            should_save = (
-                tokens_processed == tokens_total  # prefill complete
-                or (
-                    tokens_processed - s["last"] >= _checkpoint_interval
-                    and tokens_processed < tokens_total
-                )
+            should_save = tokens_processed == tokens_total or (  # prefill complete
+                tokens_processed - s["last"] >= _checkpoint_interval
+                and tokens_processed < tokens_total
             )
             if should_save:
                 s["last"] = tokens_processed
@@ -1005,9 +1000,7 @@ class ResponseGenerator:
             rqueue.put(None)
 
             # Save the KV cache again
-            self._store_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            self._store_cache(self.model_provider.model_key, cache_key, cache)
 
         except Exception as e:
             rqueue.put(e)
@@ -1485,8 +1478,11 @@ class APIHandler(BaseHTTPRequestHandler):
             for tool_text in tool_calls:
                 try:
                     parsed = ctx.tool_parser(tool_text, request.tools)
-                except Exception:
-                    logging.warning("Tool parser failed, skipping tool call")
+                except Exception as e:
+                    logging.warning(
+                        f"Tool parser failed (type={type(e).__name__}, msg={e!r}), "
+                        f"tool_text={tool_text!r}, skipping tool call"
+                    )
                     continue
                 if isinstance(parsed, list):
                     result.extend(format_tool_call(tc) for tc in parsed)
@@ -1519,7 +1515,6 @@ class APIHandler(BaseHTTPRequestHandler):
         finish_reason = "length"
         # Process the generated tokens
         for gen in response:
-            logging.debug(gen.text)
 
             # Gather the text in tool calling or text variables
             if in_reasoning:
@@ -1560,6 +1555,16 @@ class APIHandler(BaseHTTPRequestHandler):
             if stop_condition.stop_met:
                 finish_reason = "tool_calls" if made_tool_call else "stop"
                 ctx.stop()
+                last_token = tokens[-1] if tokens else None
+                is_eos = (
+                    last_token in ctx.eos_token_ids if last_token is not None else False
+                )
+                logging.debug(
+                    f"Stop condition met: finish_reason={finish_reason}, "
+                    f"last_token={last_token}, is_eos={is_eos}, "
+                    f"trim_length={stop_condition.trim_length}, "
+                    f"tokens_generated={len(tokens)}"
+                )
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
                 segment = ""
@@ -1594,6 +1599,17 @@ class APIHandler(BaseHTTPRequestHandler):
         # Flush any remaining tool text (e.g. when tool_call_end is empty)
         if in_tool_call and tool_text:
             tool_calls.append(tool_text)
+
+        # Log generation termination state for debugging
+        if in_tool_call or in_reasoning or (tool_text and not in_tool_call):
+            logging.warning(
+                f"Generation terminated with incomplete state: "
+                f"finish_reason={finish_reason}, "
+                f"in_tool_call={in_tool_call}, in_reasoning={in_reasoning}, "
+                f"tool_text_remaining={repr(tool_text)[:200]}, "
+                f"reasoning_remaining={repr(reasoning_text)[:200]}, "
+                f"tokens_generated={len(tokens)}"
+            )
 
         if self.stream:
             response = self.generate_response(
@@ -1829,6 +1845,7 @@ def run(
     cache_dir = getattr(model_provider.cli_args, "prompt_cache_dir", None)
     if cache_dir:
         from .disk_cache import DiskBackedPromptCache
+
         max_disk = getattr(model_provider.cli_args, "prompt_cache_disk_size", 100)
         prompt_cache = DiskBackedPromptCache(
             max_size=model_provider.cli_args.prompt_cache_size,

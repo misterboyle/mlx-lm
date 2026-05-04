@@ -1,0 +1,78 @@
+{
+  "config": {
+    "sessions": 2,
+    "steps": 2,
+    "step_size": 100,
+    "shared_size": 200,
+    "model": "mlx-moe//Users/michael/.localllm/models/Qwen3.6-35B-A3B-UD-MLX-4bit",
+    "total_time": 0.02
+  },
+  "sessions": [
+    {
+      "session_id": "ses_21a123472ffeWo9x6eIevWRTg4",
+      "steps": [
+        {
+          "step": 0,
+          "prompt_tokens": 609,
+          "shared_tokens": 200,
+          "unique_tokens": 409,
+          "response_tokens": 0,
+          "ttft": 0.0054,
+          "tps": 0,
+          "total_time": 0.0054,
+          "error": "'NoneType' object has no attribute 'get'",
+          "cache_hit_ratio_est": 0
+        },
+        {
+          "step": 1,
+          "prompt_tokens": 609,
+          "shared_tokens": 200,
+          "unique_tokens": 409,
+          "response_tokens": 0,
+          "ttft": 0.0076,
+          "tps": 0,
+          "total_time": 0.0076,
+          "error": "'NoneType' object has no attribute 'get'",
+          "cache_hit_ratio_est": 0
+        }
+      ]
+    },
+    {
+      "session_id": "ses_21a12346effeyrKdLhiL5e7ZVc",
+      "steps": [
+        {
+          "step": 0,
+          "prompt_tokens": 608,
+          "shared_tokens": 200,
+          "unique_tokens": 408,
+          "response_tokens": 0,
+          "ttft": 0.0099,
+          "tps": 0,
+          "total_time": 0.0099,
+          "error": "'NoneType' object has no attribute 'get'",
+          "cache_hit_ratio_est": 0
+        },
+        {
+          "step": 1,
+          "prompt_tokens": 608,
+          "shared_tokens": 200,
+          "unique_tokens": 408,
+          "response_tokens": 0,
+          "ttft": 0.0055,
+          "tps": 0,
+          "total_time": 0.0055,
+          "error": "'NoneType' object has no attribute 'get'",
+          "cache_hit_ratio_est": 0
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_requests": 4,
+    "ttft_avg": 0.0071,
+    "ttft_p95": 0.0099,
+    "tps_avg": 0,
+    "tps_min": 0,
+    "cache_hit_ratio_avg": 0.0
+  }
+}
