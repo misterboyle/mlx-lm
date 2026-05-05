@@ -1600,6 +1600,17 @@ class APIHandler(BaseHTTPRequestHandler):
         if in_tool_call and tool_text:
             tool_calls.append(tool_text)
 
+        # Log full response content for debugging tool call issues
+        parsed_tools = parse_tools(tool_calls)
+        logging.debug(
+            f"Response content: finish_reason={finish_reason}, "
+            f"tokens_generated={len(tokens)}, "
+            f"reasoning_text={repr(reasoning_text)[:500]}, "
+            f"text={repr(text)[:500]}, "
+            f"tool_calls={len(parsed_tools)}, "
+            f"parsed_tools={json.dumps(parsed_tools, ensure_ascii=False)[:1000]}"
+        )
+
         # Log generation termination state for debugging
         if in_tool_call or in_reasoning or (tool_text and not in_tool_call):
             logging.warning(
