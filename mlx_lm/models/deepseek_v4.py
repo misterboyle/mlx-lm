@@ -110,9 +110,15 @@ class SparseKVCache(_BaseCache):
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            self.keys = mx.zeros((B, n_kv_heads, n_steps * self.step, k_head_dim), keys.dtype)
-            self.values = mx.zeros((B, n_kv_heads, n_steps * self.step, v_head_dim), values.dtype)
+            needed = prev + keys.shape[2]
+            n_steps = (needed + self.step - 1) // self.step
+            new_k = mx.zeros((B, n_kv_heads, n_steps * self.step, k_head_dim), keys.dtype)
+            new_v = mx.zeros((B, n_kv_heads, n_steps * self.step, v_head_dim), values.dtype)
+            if self.keys is not None:
+                new_k[..., :prev, :] = self.keys[..., :prev, :]
+                new_v[..., :prev, :] = self.values[..., :prev, :]
+            self.keys = new_k
+            self.values = new_v
         self.offset += keys.shape[2]
         self.keys[..., prev:self.offset, :] = keys
         self.values[..., prev:self.offset, :] = values
@@ -574,6 +580,62 @@ class DeepseekV4Attention(nn.Module):
         weights = mx.softmax(scores, axis=-1)
         return weights @ all_kv[:, None, :, :]
 
+    def _continuation_prefill(self, q, kv, x, B, L, offset):
+        """Handle continuation prefill chunks (chunked prefill support).
+
+        When the server splits a long prompt into chunks, subsequent chunks
+        arrive as L>1 but buffers already exist from the first chunk.
+        Dense attention within chunk + update buffers.
+        """
+        win = self.window_size
+        comp_n = getattr(self, '_comp_n', 0)
+
+        # Attend within chunk + existing compressed context
+        if self._comp_buf is not None and comp_n > 0:
+            comp_valid = self._comp_buf[:, :comp_n]
+            all_kv = mx.concatenate([kv, comp_valid], axis=1)
+            T = all_kv.shape[1]
+            # Causal within chunk + all compressed visible
+            s = mx.arange(L)[:, None]
+            t_raw = mx.arange(L)[None, :]
+            raw_mask = (t_raw <= s) & (t_raw >= mx.maximum(s - win + 1, 0))
+            comp_mask = mx.ones((L, comp_n), dtype=mx.bool_)
+            mask_full = mx.concatenate([raw_mask, comp_mask], axis=1)
+            scores = (q @ all_kv[:, None, :, :].transpose(0, 1, 3, 2)) * self.scale
+            scores = scores + self.attn_sink[:, None, None]
+            scores = mx.where(mask_full, scores, -1e9)
+            weights = mx.softmax(scores, axis=-1)
+            output = weights @ all_kv[:, None, :, :]
+        else:
+            # No compressed context, dense causal within chunk
+            s = mx.arange(L)[:, None]
+            t = mx.arange(L)[None, :]
+            causal = t <= s
+            scores = (q @ kv[:, None, :, :].transpose(0, 1, 3, 2)) * self.scale
+            scores = scores + self.attn_sink[:, None, None]
+            scores = mx.where(causal, scores, -1e9)
+            weights = mx.softmax(scores, axis=-1)
+            output = weights @ kv[:, None, :, :]
+
+        # Extend compressed buffer with new chunk
+        comp = self.compressor(x, offset, self.rope)
+        if comp is not None:
+            self._comp_buf, self._comp_n = _buf_append(
+                self._comp_buf, comp_n, comp)
+
+        # Run indexer compressor to stay in sync
+        if hasattr(self, 'indexer'):
+            idx_comp = self.indexer.compressor(x, offset, self.rope)
+            if idx_comp is not None:
+                self.indexer._index_kv, self.indexer._idx_n = _buf_append(
+                    self.indexer._index_kv,
+                    getattr(self.indexer, '_idx_n', 0), idx_comp)
+
+        # Update window buffer with this chunk's last tokens
+        self._init_win_buf(kv, B, L)
+
+        return output
+
     def _sparse_decode(self, q, kv, x, B, offset, qr):
         """Sparse decode: window + compressed with Indexer selection."""
         win = self.window_size
@@ -716,9 +778,13 @@ class DeepseekV4Attention(nn.Module):
             else:
                 output = self._dense_attn(q, kv_all, mask, L)
         elif L > 1:
-            # Sparse prefill: window + compressed
-            output = self._sparse_prefill(q, kv, x, B, L)
-            self._init_win_buf(kv, B, L)
+            if getattr(self, '_win_buf', None) is None:
+                # First prefill chunk: sparse prefill + init buffers
+                output = self._sparse_prefill(q, kv, x, B, L)
+                self._init_win_buf(kv, B, L)
+            else:
+                # Continuation prefill chunk: extend existing buffers
+                output = self._continuation_prefill(q, kv, x, B, L, offset)
             cache.update_and_fetch(
                 mx.zeros((B, 1, L, 1)), mx.zeros((B, 1, L, 1)))
         else:
