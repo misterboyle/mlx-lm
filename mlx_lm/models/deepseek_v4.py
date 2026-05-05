@@ -631,6 +631,9 @@ class DeepseekV4Attention(nn.Module):
                     self.indexer._index_kv, self.indexer._idx_n = _buf_append(
                         self.indexer._index_kv,
                         getattr(self.indexer, '_idx_n', 0), idx_comp)
+            # Flush Metal buffers to avoid resource limit
+            if (i + 1) % 32 == 0:
+                mx.eval(self.compressor._kv_state)
 
         # Update window buffer with this chunk's last tokens
         self._init_win_buf(kv, B, L)
@@ -640,6 +643,12 @@ class DeepseekV4Attention(nn.Module):
     def _sparse_decode(self, q, kv, x, B, offset, qr):
         """Sparse decode: window + compressed with Indexer selection."""
         win = self.window_size
+
+        # Safety: init buffers if missing (single-token prompt edge case)
+        if getattr(self, '_win_buf', None) is None:
+            self._init_win_buf(kv, B, 1)
+            self._comp_buf = None
+            self._comp_n = 0
 
         # Update window buffer
         pos = offset % win
@@ -779,12 +788,12 @@ class DeepseekV4Attention(nn.Module):
             else:
                 output = self._dense_attn(q, kv_all, mask, L)
         elif L > 1:
-            if getattr(self, '_win_buf', None) is None:
-                # First prefill chunk: sparse prefill + init buffers
+            if offset == 0:
+                # First prefill chunk (new conversation)
                 output = self._sparse_prefill(q, kv, x, B, L)
                 self._init_win_buf(kv, B, L)
             else:
-                # Continuation prefill chunk: extend existing buffers
+                # Continuation prefill chunk (chunked prefill)
                 output = self._continuation_prefill(q, kv, x, B, L, offset)
             cache.update_and_fetch(
                 mx.zeros((B, 1, L, 1)), mx.zeros((B, 1, L, 1)))
@@ -966,7 +975,8 @@ class HyperConnectionBlock(nn.Module):
 
         comb = comb_raw.reshape(B, S, hc, hc)
         comb = mx.softmax(comb, axis=-1) + self.hc_eps
-        for _ in range(self.hc_sinkhorn_iters):
+        n_iters = self.hc_sinkhorn_iters
+        for _ in range(n_iters):
             comb = comb / comb.sum(axis=-2, keepdims=True)
             comb = comb / comb.sum(axis=-1, keepdims=True)
 
