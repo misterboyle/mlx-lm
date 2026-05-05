@@ -617,19 +617,20 @@ class DeepseekV4Attention(nn.Module):
             weights = mx.softmax(scores, axis=-1)
             output = weights @ kv[:, None, :, :]
 
-        # Extend compressed buffer with new chunk
-        comp = self.compressor(x, offset, self.rope)
-        if comp is not None:
-            self._comp_buf, self._comp_n = _buf_append(
-                self._comp_buf, comp_n, comp)
-
-        # Run indexer compressor to stay in sync
-        if hasattr(self, 'indexer'):
-            idx_comp = self.indexer.compressor(x, offset, self.rope)
-            if idx_comp is not None:
-                self.indexer._index_kv, self.indexer._idx_n = _buf_append(
-                    self.indexer._index_kv,
-                    getattr(self.indexer, '_idx_n', 0), idx_comp)
+        # Extend compressed buffer: process chunk token-by-token
+        # (compressor decode mode expects L=1)
+        for i in range(L):
+            comp = self.compressor(x[:, i:i+1], offset + i, self.rope)
+            if comp is not None:
+                self._comp_buf, self._comp_n = _buf_append(
+                    self._comp_buf, getattr(self, '_comp_n', 0), comp)
+            if hasattr(self, 'indexer'):
+                idx_comp = self.indexer.compressor(
+                    x[:, i:i+1], offset + i, self.rope)
+                if idx_comp is not None:
+                    self.indexer._index_kv, self.indexer._idx_n = _buf_append(
+                        self.indexer._index_kv,
+                        getattr(self.indexer, '_idx_n', 0), idx_comp)
 
         # Update window buffer with this chunk's last tokens
         self._init_win_buf(kv, B, L)
