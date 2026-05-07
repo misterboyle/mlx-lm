@@ -1,3 +1,40 @@
+## DeepSeek V4 Support
+
+First MLX implementation of [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4) (284B MoE). This fork adds full inference support including:
+
+- **Architecture**: CSA/HCA sparse attention, Hyper-Connections, Lightning Indexer, 256 MoE experts
+- **Custom fused Metal kernels** for decode acceleration
+- **Disk-backed KV cache** for large context lengths
+- **Multi-turn cache reuse**, stream threading fix, tokenizer fallback for unknown model types
+
+### Performance (Mac Studio M3 Ultra 512GB)
+
+| Quantization | Throughput | RAM Usage |
+|---|---|---|
+| 4-bit (MLX) | 21 tok/s | 161 GB |
+| 8-bit (MLX) | 8.5 tok/s | 303 GB |
+
+### Quick Start
+
+```sh
+pip install git+https://github.com/arozanov/mlx-lm.git@feature/turboquant-kv-cache
+huggingface-cli download mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit --local-dir models/DeepSeek-V4-Flash-4bit
+mlx_lm.server --model models/DeepSeek-V4-Flash-4bit --host 127.0.0.1 --port 8080 --prompt-cache-size 5 --no-batch
+```
+
+For 8-bit:
+
+```sh
+huggingface-cli download mlx-community/deepseek-ai-DeepSeek-V4-Flash-8bit --local-dir models/DeepSeek-V4-Flash-8bit
+mlx_lm.server --model models/DeepSeek-V4-Flash-8bit --host 127.0.0.1 --port 8080 --prompt-cache-size 3 --no-batch
+```
+
+**Requirements**: Apple Silicon Mac, 192GB+ unified RAM (4-bit) or 384GB+ (8-bit).
+
+**Branch**: `feature/turboquant-kv-cache`
+
+---
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
