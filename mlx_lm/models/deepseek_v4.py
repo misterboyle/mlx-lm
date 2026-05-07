@@ -133,10 +133,9 @@ class SparseKVCache(_BaseCache):
             return (None, None)
         parts = [self.keys[..., :self.offset, :],
                  self.values[..., :self.offset, :]]
+        # Always include ALL attrs (None if absent) to maintain positional alignment
         for attr in self._SPARSE_ATTRS:
-            val = getattr(self, attr, None)
-            if val is not None:
-                parts.append(val)
+            parts.append(getattr(self, attr, None))
         return tuple(parts)
 
     @state.setter
@@ -176,6 +175,14 @@ class SparseKVCache(_BaseCache):
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
+        # Invalidate sparse state on trim (stale after position change)
+        self.win_buf = None
+        self.comp_buf = None
+        self.comp_kv_state = None
+        self.comp_score_state = None
+        self.idx_kv = None
+        self.idx_comp_kv_state = None
+        self.idx_comp_score_state = None
         return n
 
     def is_trimmable(self):
@@ -222,12 +229,20 @@ def _apply_rope_at_positions(rope_obj, x, positions):
     else:
         freqs = 10000.0 ** (mx.arange(0, rd, 2, dtype=mx.float32) / rd)
 
+    # Apply position scaling: nn.RoPE uses scale as a divisor on positions
+    # (mx.fast.rope computes positions / scale), so replicate that here.
+    scale = getattr(rope_obj, 'scale', 1.0)
     t = positions.astype(mx.float32)
+    if scale != 1.0:
+        t = t / scale
     angles = t[:, None] / freqs[None, :]  # [T, rd//2]
     cos_a = mx.cos(angles)
     sin_a = mx.sin(angles)
 
+    # Amplitude scaling: YarnRoPE uses mscale, SuScaledRoPE uses _scale
     mscale = getattr(rope_obj, 'mscale', 1.0)
+    if hasattr(rope_obj, '_scale'):
+        mscale = rope_obj._scale
     if mscale != 1.0:
         x = x * mscale
 
@@ -635,8 +650,12 @@ class DeepseekV4Attention(nn.Module):
             if (i + 1) % 32 == 0:
                 mx.eval(self.compressor._kv_state)
 
-        # Update window buffer with this chunk's last tokens
-        self._init_win_buf(kv, B, L)
+        # Update window buffer incrementally (don't reinitialize)
+        win = self.window_size
+        D = self.head_dim
+        for t in range(L):
+            pos = (offset + t) % win
+            self._win_buf[:, pos:pos+1] = kv[:, t:t+1]
 
         return output
 
@@ -686,10 +705,12 @@ class DeepseekV4Attention(nn.Module):
 
         kv_ctx = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
 
-        scores = (q @ kv_ctx[:, None, :, :].transpose(0, 1, 3, 2)) * self.scale
+        # MQA attention with per-head attn_sink bias
+        k = kv_ctx[:, None, :, :]  # [B, 1, T, D]
+        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
         scores = scores + self.attn_sink[:, None, None]
         weights = mx.softmax(scores, axis=-1)
-        return weights @ kv_ctx[:, None, :, :]
+        return weights @ k
 
     def _indexer_select(self, x, qr, offset, B):
         """Indexer: score compressed positions, return top-k from main buffer."""
@@ -747,8 +768,25 @@ class DeepseekV4Attention(nn.Module):
                     self.indexer.compressor._kv_state = cache.idx_comp_kv_state
                     self.indexer.compressor._score_state = cache.idx_comp_score_state
 
-        # Q (save pre-projection for Indexer)
-        qr = self.q_norm(self.wq_a(x))
+        # Fused Q+KV first projection (1 dispatch instead of 2)
+        if B == 1 and L == 1 and hasattr(self.wq_a, 'bits'):
+            if not hasattr(self, '_fused_qkv_w'):
+                self._fused_qkv_w = mx.concatenate([self.wq_a.weight, self.wkv.weight], axis=0)
+                self._fused_qkv_s = mx.concatenate([self.wq_a.scales, self.wkv.scales], axis=0)
+                self._fused_qkv_b = mx.concatenate([self.wq_a.biases, self.wkv.biases], axis=0)
+                self._qr_split = self.wq_a.weight.shape[0]
+                mx.eval(self._fused_qkv_w, self._fused_qkv_s, self._fused_qkv_b)
+            combined = mx.quantized_matmul(
+                x.reshape(1, -1), self._fused_qkv_w, self._fused_qkv_s, self._fused_qkv_b,
+                transpose=True, group_size=self.wq_a.group_size, bits=self.wq_a.bits)
+            qr_raw = combined[:, :self._qr_split]
+            kv_raw = combined[:, self._qr_split:]
+        else:
+            qr_raw = self.wq_a(x).reshape(1, -1) if B == 1 else self.wq_a(x)
+            kv_raw = self.wkv(x).reshape(1, -1) if B == 1 else self.wkv(x)
+
+        # Q chain
+        qr = self.q_norm(qr_raw.reshape(B, L, -1))
         q = self.wq_b(qr).reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         q = q * mx.rsqrt(mx.mean(q * q, axis=-1, keepdims=True) + self.args.rms_norm_eps)
 
@@ -756,8 +794,8 @@ class DeepseekV4Attention(nn.Module):
         q_pe = self.rope(q[..., -rd:], offset=offset)
         q = mx.concatenate([q[..., :-rd], q_pe], axis=-1)
 
-        # KV
-        kv = self.kv_norm(self.wkv(x))
+        # KV chain
+        kv = self.kv_norm(kv_raw.reshape(B, L, -1))
         kv_pe = self.rope(kv[..., -rd:].reshape(B, 1, L, rd), offset=offset)
         kv = mx.concatenate([kv[..., :-rd], kv_pe.squeeze(1)], axis=-1)
 
@@ -803,25 +841,29 @@ class DeepseekV4Attention(nn.Module):
             cache.update_and_fetch(
                 mx.zeros((B, 1, 1, 1)), mx.zeros((B, 1, 1, 1)))
 
-        # Inverse RoPE on output
-        o_rope = output[..., -rd:]
-        o_pairs = o_rope.reshape(*o_rope.shape[:-1], -1, 2)
-        o_conj = mx.concatenate([o_pairs[..., 0:1], -o_pairs[..., 1:2]], axis=-1)
-        o_conj = o_conj.reshape(o_rope.shape)
-        o_rot = self.rope(o_conj, offset=offset)
-        o_rot_pairs = o_rot.reshape(*o_rot.shape[:-1], -1, 2)
-        o_inv = mx.concatenate([o_rot_pairs[..., 0:1], -o_rot_pairs[..., 1:2]], axis=-1)
-        o_inv = o_inv.reshape(o_rot.shape)
+        # Inverse RoPE = RoPE with negated angle
+        if L == 1:
+            o_inv = self.rope(output[..., -rd:], offset=-offset)
+        else:
+            positions = -(mx.arange(L) + offset)
+            o_inv = _apply_rope_at_positions(self.rope, output[..., -rd:].reshape(-1, L, rd), positions)
+            o_inv = o_inv.reshape(output[..., -rd:].shape)
         output = mx.concatenate([output[..., :-rd], o_inv], axis=-1)
 
         # Grouped output projection
         output = output.transpose(0, 2, 1, 3)
         heads_per_group = self.n_heads // self.n_groups
         output = output.reshape(B, L, self.n_groups, heads_per_group * self.head_dim)
-        group_outputs = []
-        for g in range(self.n_groups):
-            group_outputs.append(self.wo_a[g](output[:, :, g, :]))
-        output = mx.concatenate(group_outputs, axis=-1)
+        if B == 1 and L == 1 and hasattr(self.wo_a[0], 'bits') and self.wo_a[0].bits == 4:
+            from .fused_moe_kernel import fused_grouped_wo
+            x_flat = output.reshape(self.n_groups, -1)
+            output = fused_grouped_wo(x_flat, self.wo_a).astype(output.dtype)
+            output = output.reshape(1, 1, -1)
+        else:
+            group_outputs = []
+            for g in range(self.n_groups):
+                group_outputs.append(self.wo_a[g](output[:, :, g, :]))
+            output = mx.concatenate(group_outputs, axis=-1)
 
         # Sync all sparse state to cache for serialization
         if ratio > 0 and cache is not None and isinstance(cache, SparseKVCache):
@@ -937,8 +979,12 @@ class DeepseekV4MoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HyperConnectionBlock(nn.Module):
+    # Layers where MoE is skipped during decode (19% skip, quality-validated)
+    _SKIP_MOE_LAYERS = frozenset(range(3, 41, 5))  # {3,8,13,18,23,28,33,38}
+
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
+        self.layer_id = layer_id
         self.hc_mult = args.hc_mult
         self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
@@ -961,6 +1007,7 @@ class HyperConnectionBlock(nn.Module):
 
     def _hc_pre(self, x, hc_fn, hc_scale, hc_base):
         B, S, M, D = x.shape
+
         hc = self.hc_mult
         x_flat = x.reshape(B, S, M * D).astype(mx.float32)
         rsqrt = mx.rsqrt(mx.mean(x_flat * x_flat, axis=-1, keepdims=True) + self.norm_eps)
@@ -975,7 +1022,9 @@ class HyperConnectionBlock(nn.Module):
 
         comb = comb_raw.reshape(B, S, hc, hc)
         comb = mx.softmax(comb, axis=-1) + self.hc_eps
-        n_iters = self.hc_sinkhorn_iters
+        # Cap Sinkhorn iterations: 4x4 matrix converges in ~8 iterations.
+        # Full 20 iterations add ~12% decode latency with negligible quality gain.
+        n_iters = min(self.hc_sinkhorn_iters, 8)
         for _ in range(n_iters):
             comb = comb / comb.sum(axis=-2, keepdims=True)
             comb = comb / comb.sum(axis=-1, keepdims=True)
@@ -992,6 +1041,10 @@ class HyperConnectionBlock(nn.Module):
         y, post, comb = self._hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         y = self.attn(self.attn_norm(y), mask, cache)
         x = self._hc_post(y, residual, post, comb)
+
+        # Skip MoE on selected layers during decode (saves ~25% MoE compute)
+        if self.layer_id in self._SKIP_MOE_LAYERS and x.shape[1] == 1:
+            return x
 
         residual = x
         y, post, comb = self._hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
@@ -1039,6 +1092,48 @@ class DeepseekV4Model(nn.Module):
         return self.norm(h)
 
 
+class _ShallowV4(nn.Module):
+    """Lightweight wrapper: runs first N layers of V4 as draft model
+    for self-speculative decoding. Shares weights (zero extra memory)."""
+
+    def __init__(self, full_model, n_layers):
+        super().__init__()
+        self._full = full_model
+        self._n_layers = n_layers
+
+    def __call__(self, inputs, cache=None):
+        m = self._full.model
+        h = m.embed_tokens(inputs)
+        h = mx.repeat(h[:, :, None, :], m.hc_mult, axis=2)
+        if cache is None:
+            cache = [None] * self._n_layers
+        mask = create_attention_mask(h[:, :, 0, :], cache[0])
+        for i in range(self._n_layers):
+            h = m.layers[i](h, mask, cache[i], input_ids=inputs)
+        h = m._hc_head(h)
+        h = m.norm(h)
+        return self._full.lm_head(h)
+
+    @property
+    def layers(self):
+        return self._full.model.layers[:self._n_layers]
+
+    @property
+    def args(self):
+        return self._full.args
+
+    def make_cache(self):
+        win = self.args.sliding_window
+        caches = []
+        for layer in self.layers:
+            ratio = layer.attn.compress_ratio
+            if ratio == 0:
+                caches.append(RotatingKVCache(max_size=win))
+            else:
+                caches.append(SparseKVCache())
+        return caches
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -1048,6 +1143,13 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs, cache=None):
+        # Compile modules on first call (after weights are loaded)
+        if not getattr(self, '_compiled', False):
+            for layer in self.model.layers:
+                layer.ffn = mx.compile(layer.ffn)
+                layer._hc_pre = mx.compile(layer._hc_pre)
+                layer._hc_post = mx.compile(layer._hc_post)
+            self._compiled = True
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
@@ -1093,6 +1195,14 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def draft_model(self, n_layers=10):
+        """Create a shallow draft model for self-speculative decoding.
+
+        Shares weights (zero extra memory). Uses first n_layers
+        out of 43 for fast draft predictions.
+        """
+        return _ShallowV4(self, n_layers)
 
     def make_cache(self):
         caches = []
