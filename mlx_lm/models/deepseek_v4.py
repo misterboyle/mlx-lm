@@ -1683,9 +1683,13 @@ class Model(nn.Module):
 
     def __call__(self, inputs, cache=None):
         # Compile modules on first call (after weights are loaded)
+        # Skip compilation when expert offloading is active since the
+        # offloaded code path uses Python-level LRU mutations and lazy I/O.
         if not getattr(self, '_compiled', False):
+            skip_compile = getattr(self, '_expert_offloading', False)
             for layer in self.model.layers:
-                layer.ffn = mx.compile(layer.ffn)
+                if not skip_compile:
+                    layer.ffn = mx.compile(layer.ffn)
                 layer._hc_pre = mx.compile(layer._hc_pre)
                 layer._hc_post = mx.compile(layer._hc_post)
             self._compiled = True

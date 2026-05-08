@@ -352,6 +352,22 @@ class ModelProvider:
                 tokenizer_config=self._tokenizer_config,
             )
 
+        # Enable MoE expert offloading if requested
+        max_re = getattr(self.cli_args, "max_resident_experts", None)
+        if max_re is not None and max_re > 0:
+            from .models.expert_offload import enable_expert_offloading
+
+            n_layers = enable_expert_offloading(
+                model, model_path, max_resident_experts=max_re,
+            )
+            if n_layers > 0:
+                logging.info(
+                    "Expert offloading enabled on %d layers, "
+                    "max %d experts resident per layer",
+                    n_layers,
+                    max_re,
+                )
+
         # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -1918,6 +1934,15 @@ def main():
         default=None,
         help="Use standard affine quantization for values at the given "
         "bit width (e.g. 4) instead of PolarQuant. Requires --turbo-kv-bits.",
+    )
+    parser.add_argument(
+        "--max-resident-experts",
+        type=int,
+        default=None,
+        help="Enable MoE expert offloading: keep at most N experts per "
+        "layer in RAM and stream cold ones from disk. Useful for models "
+        "with many experts (e.g. DeepSeek V4 with 256 experts). "
+        "Set to 0 to disable. A good starting value is 32.",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
