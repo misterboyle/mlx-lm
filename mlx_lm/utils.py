@@ -52,6 +52,7 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "mimo_v2": "mimo_v2_flash",
 }
 
 MAX_FILE_SIZE_GB = 5
