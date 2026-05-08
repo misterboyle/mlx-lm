@@ -1738,35 +1738,6 @@ class Model(nn.Module):
         # --- Step 1b: Thump604 MLX conversion remapping ---
         if is_thump604:
             weights = self._remap_thump604(weights)
-            # Build quantization config remap so _quantize uses correct bits
-            self._quantization_config_remap = {}
-            for k in weights:
-                if not k.endswith(".scales"):
-                    continue
-                param_path = k.rsplit(".scales", 1)[0]
-                # Find original Thump604 key by reversing our remaps
-                orig = param_path
-                orig = orig.replace(".ffn.experts.", ".ffn.switch_mlp.")
-                orig = orig.replace(".shared_experts.w1", ".shared_experts.gate_proj")
-                orig = orig.replace(".shared_experts.w3", ".shared_experts.up_proj")
-                orig = orig.replace(".shared_experts.w2", ".shared_experts.down_proj")
-                if orig != param_path:
-                    # Look up in original config quantization
-                    # We infer bits from weight shape vs scales shape
-                    w_key = param_path + ".weight"
-                    s_key = param_path + ".scales"
-                    if w_key in weights and s_key in weights:
-                        w, s = weights[w_key], weights[s_key]
-                        if w.ndim >= 2 and s.ndim >= 2:
-                            gs = 128  # default group_size
-                            input_dim = s.shape[-1] * gs
-                            packed_dim = w.shape[-1]
-                            if packed_dim > 0:
-                                bits = (input_dim * 16) // (packed_dim * 32)
-                                if bits in (2, 4, 6, 8):
-                                    self._quantization_config_remap[param_path] = {
-                                        "group_size": gs, "bits": bits, "mode": "affine"
-                                    }
 
         # --- Step 2: Top-level key remapping ---
         renames = {}
