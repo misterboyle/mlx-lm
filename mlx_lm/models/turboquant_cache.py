@@ -43,8 +43,12 @@ class _Quantizer:
 class TurboQuantKVCache:
     """TurboQuant KV cache — drop-in replacement for KVCache.
 
-    Compresses KV vectors using PolarQuant (Hadamard rotation + Lloyd-Max
-    codebook quantization). Stores bit-packed indices in uint32 + float32 norms.
+    Compresses keys using PolarQuant (Hadamard rotation + Lloyd-Max codebook
+    quantization). Stores bit-packed indices in uint32 + float32 norms.
+
+    Values can be compressed either with PolarQuant (default) or with standard
+    affine quantization (when ``v_bits`` is set). Affine quantization is simpler,
+    faster, and values tolerate it well without rotation.
 
     Uses fused Metal kernels for quantize and dequantize operations.
     Maintains an incremental decode buffer for O(1) per-step dequantization.
@@ -52,15 +56,22 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, seed: int = 42):
+    def __init__(self, bits: int = 3, seed: int = 42, v_bits=None):
         self.quant_bits = bits
         self.seed = seed
+        self.v_bits = v_bits
+        self.v_group_size = 64
         self.offset = 0
 
         self.k_packed = None
         self.k_norms = None
         self.v_packed = None
         self.v_norms = None
+
+        # Affine-quantized value storage (used when v_bits is set)
+        self._v_quant = None   # quantized uint32 data
+        self._v_scales = None  # per-group scales
+        self._v_biases = None  # per-group biases
 
         self._k_deq_buf = None
         self._v_deq_buf = None
@@ -80,10 +91,12 @@ class TurboQuantKVCache:
             self._k_q = _Quantizer(k_dim, self.quant_bits, self.seed)
             self._k_dim = k_dim
             self._k_pdim = packed_dim(k_dim, self.quant_bits)
-        if self._v_q is None:
+        if self._v_q is None and self.v_bits is None:
             self._v_q = _Quantizer(v_dim, self.quant_bits, self.seed + 1)
             self._v_dim = v_dim
             self._v_pdim = packed_dim(v_dim, self.quant_bits)
+        elif self._v_dim is None:
+            self._v_dim = v_dim
 
     def _ensure_storage(self, B, H, num_new):
         prev = self.offset
@@ -94,25 +107,58 @@ class TurboQuantKVCache:
                 # Allocate new buffer and copy old data into it
                 new_kp = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
                 new_kn = mx.zeros((B, H, n), dtype=mx.float32)
-                new_vp = mx.zeros((B, H, n, self._v_pdim), dtype=mx.uint32)
-                new_vn = mx.zeros((B, H, n), dtype=mx.float32)
                 new_kp[..., :prev, :] = self.k_packed[..., :prev, :]
                 new_kn[..., :prev] = self.k_norms[..., :prev]
-                new_vp[..., :prev, :] = self.v_packed[..., :prev, :]
-                new_vn[..., :prev] = self.v_norms[..., :prev]
                 self.k_packed, self.k_norms = new_kp, new_kn
-                self.v_packed, self.v_norms = new_vp, new_vn
+
+                if self.v_bits is not None:
+                    # Affine-quantized values
+                    el_per_int = 8 * mx.uint32.size // self.v_bits
+                    v_qdim = self._v_dim // el_per_int
+                    v_sdim = self._v_dim // self.v_group_size
+                    new_vq = mx.zeros((B, H, n, v_qdim), dtype=mx.uint32)
+                    new_vs = mx.zeros((B, H, n, v_sdim), dtype=mx.float16)
+                    new_vb = mx.zeros((B, H, n, v_sdim), dtype=mx.float16)
+                    new_vq[..., :prev, :] = self._v_quant[..., :prev, :]
+                    new_vs[..., :prev, :] = self._v_scales[..., :prev, :]
+                    new_vb[..., :prev, :] = self._v_biases[..., :prev, :]
+                    self._v_quant, self._v_scales, self._v_biases = new_vq, new_vs, new_vb
+                else:
+                    new_vp = mx.zeros((B, H, n, self._v_pdim), dtype=mx.uint32)
+                    new_vn = mx.zeros((B, H, n), dtype=mx.float32)
+                    new_vp[..., :prev, :] = self.v_packed[..., :prev, :]
+                    new_vn[..., :prev] = self.v_norms[..., :prev]
+                    self.v_packed, self.v_norms = new_vp, new_vn
             else:
                 self.k_packed = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
                 self.k_norms = mx.zeros((B, H, n), dtype=mx.float32)
-                self.v_packed = mx.zeros((B, H, n, self._v_pdim), dtype=mx.uint32)
-                self.v_norms = mx.zeros((B, H, n), dtype=mx.float32)
+
+                if self.v_bits is not None:
+                    el_per_int = 8 * mx.uint32.size // self.v_bits
+                    v_qdim = self._v_dim // el_per_int
+                    v_sdim = self._v_dim // self.v_group_size
+                    self._v_quant = mx.zeros((B, H, n, v_qdim), dtype=mx.uint32)
+                    self._v_scales = mx.zeros((B, H, n, v_sdim), dtype=mx.float16)
+                    self._v_biases = mx.zeros((B, H, n, v_sdim), dtype=mx.float16)
+                else:
+                    self.v_packed = mx.zeros((B, H, n, self._v_pdim), dtype=mx.uint32)
+                    self.v_norms = mx.zeros((B, H, n), dtype=mx.float32)
 
     def _full_dequant(self, packed, norms, q, dim, B, H, total, dtype):
         flat_p = packed[..., :total, :].reshape(-1, packed.shape[-1])
         flat_n = norms[..., :total].reshape(-1)
         out = packed_dequantize(flat_p, flat_n, q.centroids, q.signs, dim, self.quant_bits)
         return out.reshape(B, H, total, dim).astype(dtype)
+
+    def _dequantize_affine_values(self, B, H, total, dtype):
+        """Dequantize affine-quantized values from _v_quant/scales/biases."""
+        vq = self._v_quant[..., :total, :]
+        vs = self._v_scales[..., :total, :]
+        vb = self._v_biases[..., :total, :]
+        return mx.dequantize(
+            vq, vs, vb,
+            group_size=self.v_group_size, bits=self.v_bits,
+        ).astype(dtype)
 
     def update_and_fetch(self, keys, values):
         B, H, S, k_dim = keys.shape
@@ -122,16 +168,26 @@ class TurboQuantKVCache:
         self._ensure_storage(B, H, S)
         prev = self.offset
 
-        # Fused Metal quantize
+        # Fused Metal quantize for keys (PolarQuant)
         k_pk, k_nrm = fused_quantize(keys.reshape(-1, k_dim), self._k_q.signs, self._k_q.boundaries, k_dim, self.quant_bits)
         k_pk = k_pk.reshape(B, H, S, self._k_pdim)
-        v_pk, v_nrm = fused_quantize(values.reshape(-1, v_dim), self._v_q.signs, self._v_q.boundaries, v_dim, self.quant_bits)
-        v_pk = v_pk.reshape(B, H, S, self._v_pdim)
 
         self.k_packed[..., prev:prev+S, :] = k_pk
         self.k_norms[..., prev:prev+S] = k_nrm.reshape(B, H, S)
-        self.v_packed[..., prev:prev+S, :] = v_pk
-        self.v_norms[..., prev:prev+S] = v_nrm.reshape(B, H, S)
+
+        if self.v_bits is not None:
+            # Affine quantize values with mx.quantize
+            vq, vs, vb = mx.quantize(values, group_size=self.v_group_size, bits=self.v_bits)
+            self._v_quant[..., prev:prev+S, :] = vq
+            self._v_scales[..., prev:prev+S, :] = vs
+            self._v_biases[..., prev:prev+S, :] = vb
+        else:
+            # PolarQuant for values
+            v_pk, v_nrm = fused_quantize(values.reshape(-1, v_dim), self._v_q.signs, self._v_q.boundaries, v_dim, self.quant_bits)
+            v_pk = v_pk.reshape(B, H, S, self._v_pdim)
+            self.v_packed[..., prev:prev+S, :] = v_pk
+            self.v_norms[..., prev:prev+S] = v_nrm.reshape(B, H, S)
+
         self.offset += S
         total = self.offset
 
@@ -146,7 +202,10 @@ class TurboQuantKVCache:
                 self._deq_alloc = na
 
             nk = dequant_fp16(k_pk.reshape(-1, self._k_pdim), k_nrm, self._k_q.centroids, self._k_q.signs, k_dim, self.quant_bits).reshape(B, H, S, k_dim)
-            nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim)
+            if self.v_bits is not None:
+                nv = mx.dequantize(vq, vs, vb, group_size=self.v_group_size, bits=self.v_bits).astype(values.dtype)
+            else:
+                nv = dequant_fp16(v_pk.reshape(-1, self._v_pdim), v_nrm, self._v_q.centroids, self._v_q.signs, v_dim, self.quant_bits).reshape(B, H, S, v_dim)
             self._k_deq_buf[..., prev:total, :] = nk
             self._v_deq_buf[..., prev:total, :] = nv
             self._deq_offset = total
@@ -154,7 +213,10 @@ class TurboQuantKVCache:
 
         # Full dequant (prefill)
         all_k = self._full_dequant(self.k_packed, self.k_norms, self._k_q, k_dim, B, H, total, keys.dtype)
-        all_v = self._full_dequant(self.v_packed, self.v_norms, self._v_q, v_dim, B, H, total, values.dtype)
+        if self.v_bits is not None:
+            all_v = self._dequantize_affine_values(B, H, total, values.dtype)
+        else:
+            all_v = self._full_dequant(self.v_packed, self.v_norms, self._v_q, v_dim, B, H, total, values.dtype)
         alloc = ((total + self.step - 1) // self.step) * self.step
         self._k_deq_buf = mx.zeros((B, H, alloc, k_dim), dtype=keys.dtype)
         self._v_deq_buf = mx.zeros((B, H, alloc, v_dim), dtype=values.dtype)
@@ -171,13 +233,26 @@ class TurboQuantKVCache:
     def nbytes(self):
         if self.k_packed is None:
             return 0
-        return (self.k_packed[..., :self.offset, :].nbytes + self.v_packed[..., :self.offset, :].nbytes +
-                self.k_norms[..., :self.offset].nbytes + self.v_norms[..., :self.offset].nbytes)
+        total = (self.k_packed[..., :self.offset, :].nbytes +
+                 self.k_norms[..., :self.offset].nbytes)
+        if self.v_bits is not None:
+            total += (self._v_quant[..., :self.offset, :].nbytes +
+                      self._v_scales[..., :self.offset, :].nbytes +
+                      self._v_biases[..., :self.offset, :].nbytes)
+        else:
+            total += (self.v_packed[..., :self.offset, :].nbytes +
+                      self.v_norms[..., :self.offset].nbytes)
+        return total
 
     @property
     def state(self):
         if self.k_packed is None:
             return []
+        if self.v_bits is not None:
+            return [self.k_packed[..., :self.offset, :], self.k_norms[..., :self.offset],
+                    self._v_quant[..., :self.offset, :],
+                    self._v_scales[..., :self.offset, :],
+                    self._v_biases[..., :self.offset, :]]
         return [self.k_packed[..., :self.offset, :], self.k_norms[..., :self.offset],
                 self.v_packed[..., :self.offset, :], self.v_norms[..., :self.offset]]
 
@@ -185,7 +260,10 @@ class TurboQuantKVCache:
     def state(self, v):
         if not v:
             return
-        self.k_packed, self.k_norms, self.v_packed, self.v_norms = v
+        if self.v_bits is not None:
+            self.k_packed, self.k_norms, self._v_quant, self._v_scales, self._v_biases = v
+        else:
+            self.k_packed, self.k_norms, self.v_packed, self.v_norms = v
         self.offset = self.k_packed.shape[2]
 
     _DTYPE_MAP = {
@@ -198,7 +276,8 @@ class TurboQuantKVCache:
     @property
     def meta_state(self):
         dtype_str = self._DTYPE_NAME.get(self._dtype, "float16")
-        return f"{self.offset},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str}"
+        v_bits_str = str(self.v_bits) if self.v_bits is not None else "0"
+        return f"{self.offset},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str}"
 
     @meta_state.setter
     def meta_state(self, v):
@@ -210,6 +289,11 @@ class TurboQuantKVCache:
             self._dtype = self._DTYPE_MAP.get(parts[5], mx.float16)
         else:
             self._dtype = mx.float16
+        if len(parts) > 6:
+            vb = int(parts[6])
+            self.v_bits = vb if vb > 0 else None
+        else:
+            self.v_bits = None
 
     def dequantize(self):
         """Return full dequantized (keys, values) as dense arrays."""
@@ -220,8 +304,11 @@ class TurboQuantKVCache:
         self._ensure_quantizer(self._k_dim, self._v_dim)
         k = self._full_dequant(self.k_packed, self.k_norms, self._k_q,
                                self._k_dim, B, H, self.offset, dtype)
-        v = self._full_dequant(self.v_packed, self.v_norms, self._v_q,
-                               self._v_dim, B, H, self.offset, dtype)
+        if self.v_bits is not None:
+            v = self._dequantize_affine_values(B, H, self.offset, dtype)
+        else:
+            v = self._full_dequant(self.v_packed, self.v_norms, self._v_q,
+                                   self._v_dim, B, H, self.offset, dtype)
         return k, v
 
     def copy(self):
@@ -260,6 +347,9 @@ class TurboQuantKVCache:
         obj.k_norms = None
         obj.v_packed = None
         obj.v_norms = None
+        obj._v_quant = None
+        obj._v_scales = None
+        obj._v_biases = None
         obj._k_deq_buf = None
         obj._v_deq_buf = None
         obj._deq_offset = 0
@@ -271,6 +361,8 @@ class TurboQuantKVCache:
         obj._k_pdim = None
         obj._v_pdim = None
         obj._dtype = None
+        obj.v_bits = None
+        obj.v_group_size = 64
         obj.meta_state = meta_state
         obj.state = state
         return obj

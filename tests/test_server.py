@@ -3,130 +3,73 @@
 import http
 import io
 import json
-import multiprocessing
-import socket
 import threading
-import time
+import types
 import unittest
 
+import mlx.core as mx
 import requests
 
-import mlx.core as mx
-
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import LRUPromptCache
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    _process_control_tokens,
+)
+from mlx_lm.utils import load
 
 
-def _server_process(with_draft, ready_queue):
-    """Run the server in a separate process with its own MLX context.
-
-    MLX streams are thread-affine, so model loading and generation must
-    happen on the same thread (the subprocess main thread). The HTTP server
-    runs on a background thread.
-    """
-    import mlx.core as mx
-    from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
-    from mlx_lm.utils import load
-
-    HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
-    model, tokenizer = load(HF_MODEL_PATH)
-
-    cli_args = type(
-        "obj",
-        (object,),
-        {
-            "adapter_path": None,
-            "chat_template": None,
-            "use_default_chat_template": False,
-            "trust_remote_code": False,
-            "draft_model": None,
-            "num_draft_tokens": 3,
-            "temp": 0.0,
-            "top_p": 1.0,
-            "top_k": 0,
-            "min_p": 0.0,
-            "max_tokens": 512,
-            "chat_template_args": {},
-            "model": None,
-            "decode_concurrency": 32,
-            "prompt_concurrency": 8,
-            "prefill_step_size": 2048,
-            "prompt_cache_size": 10,
-            "prompt_cache_bytes": 1 << 63,
-            "prompt_cache_total_bytes": None,
-            "allowed_origins": ["*"],
-        },
-    )
-
-    if with_draft:
-        draft_model, _ = load(HF_MODEL_PATH)
-        cli_args.draft_model = HF_MODEL_PATH
-    else:
-        draft_model = None
-
-    provider = type(
-        "Prov",
-        (object,),
-        {
-            "model": model,
-            "tokenizer": tokenizer,
-            "model_key": (HF_MODEL_PATH, None),
-            "draft_model": draft_model,
-            "draft_model_key": HF_MODEL_PATH if with_draft else None,
-            "is_batchable": True,
-            "cli_args": cli_args,
-            "load": lambda self, mn, adapter=None, dm=None: (model, tokenizer),
-        },
-    )()
-    cache = LRUPromptCache()
-    rg = ResponseGenerator(provider, cache)
-
-    # Find a free port
-    with socket.socket() as s:
-        s.bind(("localhost", 0))
-        port = s.getsockname()[1]
-
-    addr = ("localhost", port)
-    httpd = http.server.HTTPServer(
-        addr,
-        lambda *a, **kw: APIHandler(rg, *a, **kw),
-    )
-
-    # HTTP server runs on a background thread
-    http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    http_thread.start()
-
-    # Signal readiness
-    ready_queue.put(port)
-
-    # Generate loop runs on the subprocess main thread (same thread that
-    # loaded the model), matching the production architecture.
-    rg._generate()
-
-
-class _ServerFixture:
-    """Manages a server subprocess for tests."""
-
+class DummyModelProvider:
     def __init__(self, with_draft=False):
-        self.with_draft = with_draft
-        self.process = None
-        self.port = None
-        self.ready_queue = None
+        HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+        self.model, self.tokenizer = load(HF_MODEL_PATH)
+        self.model_key = (HF_MODEL_PATH, None)
+        self.is_batchable = True
 
-    def start(self):
-        self.ready_queue = multiprocessing.Queue()
-        self.process = multiprocessing.Process(
-            target=_server_process,
-            args=(self.with_draft, self.ready_queue),
-            daemon=True,
+        # Add draft model support
+        self.draft_model = None
+        self.draft_model_key = None
+        self.cli_args = type(
+            "obj",
+            (object,),
+            {
+                "adapter_path": None,
+                "chat_template": None,
+                "use_default_chat_template": False,
+                "trust_remote_code": False,
+                "draft_model": None,
+                "num_draft_tokens": 3,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "max_tokens": 512,
+                "chat_template_args": {},
+                "model": None,
+                "decode_concurrency": 32,
+                "prompt_concurrency": 8,
+                "prefill_step_size": 2048,
+                "prompt_cache_size": 10,
+                "prompt_cache_bytes": 1 << 63,
+                "prompt_cache_total_bytes": None,
+                "allowed_origins": ["*"],
+            },
         )
-        self.process.start()
-        self.port = self.ready_queue.get(timeout=120)
 
-    def stop(self):
-        if self.process and self.process.is_alive():
-            self.process.terminate()
-            self.process.join(timeout=10)
+        if with_draft:
+            # Use the same model as the draft model for testing
+            self.draft_model, _ = load(HF_MODEL_PATH)
+            self.draft_model_key = HF_MODEL_PATH
+            self.cli_args.draft_model = HF_MODEL_PATH
+
+    def load(self, model, adapter=None, draft_model=None):
+        assert model in ["default_model", "chat_model"]
+        return self.model, self.tokenizer
+
+    def load_default(self):
+        return self.load("default_model", None, "default_model")
 
 
 class MockCache:
@@ -149,16 +92,93 @@ class MockCache:
         return n
 
 
+class TestProcessControlTokens(unittest.TestCase):
+    @staticmethod
+    def _r(text, state, match=None):
+        return Response(text, 0, state, match, 0.0, None, ())
+
+    def test_single_tool_call_passes_body_with_open_and_close_crossings(self):
+        r = self._r
+        stream = [
+            r("hi ", "normal"),
+            r("<tool_call>", "tool", match=(0,)),
+            r("body", "tool"),
+            r("</tool_call>", "normal", match=(1,)),
+            r(" bye", "normal"),
+        ]
+        ctx = types.SimpleNamespace(
+            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+        )
+        out = list(_process_control_tokens(ctx, iter(stream)))
+
+        self.assertEqual("".join(t.text for t in out), "hi body bye")
+        states = [t.state for t in out]
+        self.assertEqual(sum(1 for a, b in zip(states, states[1:]) if a != b), 2)
+
+    def test_back_to_back_tool_calls_emit_state_crossings(self):
+        r = self._r
+        stream = [
+            r("<tool_call>", "tool", match=(0,)),
+            r("call1_body", "tool"),
+            r("</tool_call>", "normal", match=(1,)),
+            r("<tool_call>", "tool", match=(0,)),
+            r("call2_body", "tool"),
+            r("</tool_call>", "normal", match=(1,)),
+        ]
+        ctx = types.SimpleNamespace(
+            sequences={(0,): "<tool_call>", (1,): "</tool_call>"}
+        )
+        out = list(_process_control_tokens(ctx, iter(stream)))
+
+        self.assertEqual("".join(t.text for t in out), "call1_bodycall2_body")
+        states = [t.state for t in out]
+        crossings = sum(
+            1 for a, b in zip(states, states[1:]) if a == "tool" and b == "normal"
+        )
+        self.assertEqual(crossings, 2)
+
+    def test_multi_token_match_preserves_order(self):
+        r = self._r
+        match = (10, 11, 12)
+        stream = [
+            r("body", "tool"),
+            r("</", "tool"),
+            r("tool", "tool"),
+            r("_call>", "normal", match=match),
+            r(" ok", "normal"),
+        ]
+        ctx = types.SimpleNamespace(sequences={match: "</tool_call>"})
+        out = list(_process_control_tokens(ctx, iter(stream)))
+
+        self.assertEqual([t.text for t in out], ["body", "", "", "", " ok"])
+        self.assertEqual(
+            [t.state for t in out],
+            ["tool", "tool", "tool", "normal", "normal"],
+        )
+
+
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._server = _ServerFixture(with_draft=False)
-        cls._server.start()
-        cls.port = cls._server.port
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
 
     @classmethod
     def tearDownClass(cls):
-        cls._server.stop()
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -260,6 +280,33 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_make_state_machine_empty_tool_call_end(self):
+        class FakeTokenizer:
+            has_thinking = False
+            has_tool_calling = True
+            tool_call_start = "[TOOL_CALLS]"
+            tool_call_end = ""
+            tool_call_start_tokens = (100,)
+            tool_call_end_tokens = ()
+            eos_token_ids = [2]
+
+            def convert_ids_to_tokens(self, t):
+                return f"<eos{t}>"
+
+        sm, _ = self.response_generator._make_state_machine(
+            ("fake-empty-end", None, None),
+            FakeTokenizer(),
+            stop_words=[],
+        )
+        state = sm.make_state()
+        state, _, s = sm.match(state, 100)
+        self.assertEqual(s, "tool")
+        for tok in [42, 43, 44]:
+            state, _, s = sm.match(state, tok)
+            self.assertEqual(s, "tool")
+        state, _, s = sm.match(state, 2)
+        self.assertIsNone(s)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
@@ -273,29 +320,29 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
-    def test_sequence_overlap(self):
-        from mlx_lm.server import sequence_overlap
-
-        self.assertTrue(sequence_overlap([1], [1]))
-        self.assertTrue(sequence_overlap([1, 2], [1, 2]))
-        self.assertTrue(sequence_overlap([1, 3], [3, 4]))
-        self.assertTrue(sequence_overlap([1, 2, 3], [2, 3]))
-
-        self.assertFalse(sequence_overlap([1], [2]))
-        self.assertFalse(sequence_overlap([1, 2], [3, 4]))
-        self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
-
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._server = _ServerFixture(with_draft=True)
-        cls._server.start()
-        cls.port = cls._server.port
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(with_draft=True), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
 
     @classmethod
     def tearDownClass(cls):
-        cls._server.stop()
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
 
     def test_handle_completions_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -578,6 +625,41 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
         self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(t, [])
+
+    def test_insert_trimmable_cache_removes_immediate_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("ab")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 2)
+
+        cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 3)
+
+    def test_insert_empty_tokens_does_not_self_destruct(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 4)
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNotNone(c)
+        self.assertEqual(t, [])
+
+    def test_fetch_empty_tokens_after_root_eviction(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        cache.insert_cache(model, [1], [MockCache("a")])
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNone(c)
         self.assertEqual(t, [])
 
     def test_lru_bytes(self):

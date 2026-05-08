@@ -174,6 +174,11 @@ class SwitchGLU(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
+        # Decode: sequential per-expert for L2 cache reuse (~1.2x faster)
+        if (x.shape[-2] <= 1 and indices.size <= 8
+                and isinstance(self.gate_proj, QuantizedSwitchLinear)):
+            return self._decode_sequential(x, indices)
+
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
@@ -197,6 +202,50 @@ class SwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+    def _decode_sequential(self, x, indices):
+        """Fused gate+up+SwiGLU Metal kernel + per-expert down proj.
+        All experts' gate+up in ONE dispatch, then sequential down."""
+        flat_idx = indices.reshape(-1)
+        n = flat_idx.shape[0]
+        g = self.gate_proj
+        d = self.down_proj
+
+        # Fused gate+up+SwiGLU: one Metal dispatch for all experts
+        if g.bits == 4:
+            from .fused_moe_kernel import fused_gate_up_swiglu
+            h = fused_gate_up_swiglu(
+                x.reshape(-1), g, self.up_proj,
+                flat_idx.astype(mx.uint32))  # [n, hidden]
+        else:
+            # Fallback for non-4-bit
+            u = self.up_proj
+            x_2d = x.reshape(1, -1)
+            hs = []
+            for i in range(n):
+                idx = flat_idx[i]
+                gi = mx.quantized_matmul(x_2d, g.weight[idx], g.scales[idx],
+                    g.biases[idx], transpose=True, group_size=g.group_size, bits=g.bits)
+                ui = mx.quantized_matmul(x_2d, u.weight[idx], u.scales[idx],
+                    u.biases[idx], transpose=True, group_size=u.group_size, bits=u.bits)
+                hs.append(self.activation(ui, gi).squeeze(0))
+            h = mx.stack(hs)
+
+        # Down proj: fused Metal kernel (all experts, one dispatch)
+        if d.bits == 4:
+            from .fused_moe_kernel import fused_down_proj
+            result = fused_down_proj(h, d, flat_idx.astype(mx.uint32))
+        else:
+            outs = []
+            for i in range(n):
+                idx = flat_idx[i]
+                oi = mx.quantized_matmul(
+                    h[i:i+1].astype(x.dtype), d.weight[idx], d.scales[idx], d.biases[idx],
+                    transpose=True, group_size=d.group_size, bits=d.bits)
+                outs.append(oi.squeeze(0))
+            result = mx.stack(outs, axis=0)
+        result = result.astype(x.dtype)
+        return result.reshape(list(x.shape[:-1]) + [n, -1])
 
 
 class SwitchMLP(nn.Module):

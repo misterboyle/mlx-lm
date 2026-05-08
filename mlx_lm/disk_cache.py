@@ -34,6 +34,34 @@ from .models.cache import (
 
 logger = logging.getLogger(__name__)
 
+# Minimum free memory (bytes) required before saving cache to disk.
+# Serialization materializes all cache arrays, temporarily doubling memory.
+_MIN_FREE_BYTES = 8 * 1024**3  # 8 GB
+
+
+def _get_free_memory_bytes() -> Optional[int]:
+    """Get available memory in bytes (macOS/Linux)."""
+    try:
+        import subprocess
+        if os.uname().sysname == "Darwin":
+            out = subprocess.check_output(["vm_stat"], text=True)
+            page_size = 16384
+            free = 0
+            for line in out.splitlines():
+                if "Pages free" in line:
+                    free += int(line.split(":")[1].strip().rstrip(".")) * page_size
+                elif "Pages inactive" in line:
+                    free += int(line.split(":")[1].strip().rstrip(".")) * page_size
+            return free
+        else:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
 
 def _cache_key_hash(model: Any, tokens: List[int]) -> str:
     """Stable hash for a (model, tokens) cache key."""
@@ -50,6 +78,15 @@ def _save_to_disk(cache_dir: Path, model: Any, tokens: List[int],
     size-0 arrays.
     """
     if cache_dir is None:
+        return
+
+    # Skip save if system is low on memory -- serialization materializes
+    # all cache arrays which can cause OOM on large models (400GB+).
+    free = _get_free_memory_bytes()
+    if free is not None and free < _MIN_FREE_BYTES:
+        logger.warning(
+            f"Skipping disk save: low memory ({free / 1024**3:.1f} GB free, "
+            f"need {_MIN_FREE_BYTES / 1024**3:.0f} GB)")
         return
     h = _cache_key_hash(model, tokens)
     entry_dir = cache_dir / h
@@ -179,6 +216,11 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
         _cache_mod.__dict__.setdefault("MixedQuantKVCache", MixedQuantKVCache)
     except ImportError:
         pass
+    try:
+        from mlx_lm.models.deepseek_v4 import SparseKVCache
+        _cache_mod.__dict__.setdefault("SparseKVCache", SparseKVCache)
+    except ImportError:
+        pass
 
     local_globals = _cache_mod.__dict__
 
@@ -188,7 +230,7 @@ def _load_from_disk(cache_dir: Path, h: str) -> Optional[dict]:
         "KVCache", "QuantizedKVCache", "RotatingKVCache",
         "CacheList", "BatchKVCache", "BatchRotatingKVCache",
         "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
-        "TurboQuantKVCache", "MixedQuantKVCache",
+        "TurboQuantKVCache", "MixedQuantKVCache", "SparseKVCache",
     }
     for c in classes:
         if c not in _ALLOWED_CACHE_CLASSES:

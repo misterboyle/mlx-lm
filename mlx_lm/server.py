@@ -9,7 +9,8 @@ import socket
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -32,69 +33,17 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, get_generation_stream, stream_generate
+from .generate import (
+    BatchGenerator,
+    SequenceStateMachine,
+    stream_generate,
+)
 from .models.cache import (
     LRUPromptCache,
-    can_trim_prompt_cache,
     make_prompt_cache,
-    trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
-
-
-def _maybe_dequantize_cache(cache):
-    """Convert MixedQuantKVCache entries back to KVCache for batch merge.
-
-    Handles both top-level and sub-caches inside CacheList.
-    """
-    from .models.cache import CacheList
-    from .models.mixed_quant_cache import MixedQuantKVCache
-
-    for i, c in enumerate(cache):
-        if isinstance(c, MixedQuantKVCache):
-            cache[i] = c.to_kvcache()
-        elif isinstance(c, CacheList):
-            new_subs = list(c.caches)
-            changed = False
-            for j, sub in enumerate(new_subs):
-                if isinstance(sub, MixedQuantKVCache):
-                    new_subs[j] = sub.to_kvcache()
-                    changed = True
-            if changed:
-                c.caches = tuple(new_subs)
-    return cache
-
-
-def _maybe_quantize_cache(cache, kv_quant_config, min_tokens=0):
-    """Convert KVCache entries to MixedQuantKVCache for LRU storage.
-
-    Handles both top-level KVCache and KVCache sub-caches inside CacheList
-    (used by MoE models like GLM-5.1).
-    """
-    if kv_quant_config is None:
-        return cache
-    k_bits, v_bits = kv_quant_config
-    from .models.cache import CacheList, KVCache
-    from .models.mixed_quant_cache import MixedQuantKVCache
-
-    for i, c in enumerate(cache):
-        if isinstance(c, MixedQuantKVCache):
-            continue
-        if isinstance(c, KVCache) and c.offset >= max(min_tokens, 1):
-            cache[i] = MixedQuantKVCache.from_kvcache(c, k_bits=k_bits, v_bits=v_bits)
-        elif isinstance(c, CacheList):
-            new_subs = list(c.caches)
-            changed = False
-            for j, sub in enumerate(new_subs):
-                if isinstance(sub, KVCache) and sub.offset >= max(min_tokens, 1):
-                    new_subs[j] = MixedQuantKVCache.from_kvcache(
-                        sub, k_bits=k_bits, v_bits=v_bits
-                    )
-                    changed = True
-            if changed:
-                c.caches = tuple(new_subs)
-    return cache
 
 
 def get_system_fingerprint():
@@ -102,67 +51,44 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
-class StopCondition(NamedTuple):
-    stop_met: bool
-    trim_length: int
-    trim_text_length: int
+class ToolCallFormatter:
+    def __init__(self, tool_parser, tools, streaming=False):
+        self._idx = 0
+        self._tool_parser = tool_parser
+        self._tools = tools
+        self._streaming = streaming
 
+    def _format(self, tc):
+        tc_id = tc.pop("id", None) or str(uuid.uuid4())
+        tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
+        out = {
+            "function": tc,
+            "type": "function",
+            "id": tc_id,
+        }
+        if self._streaming:
+            out["index"] = self._idx
+            self._idx += 1
+        return out
 
-def stopping_criteria(
-    tokens: List[int],
-    eos_token_ids: set,
-    stop_id_sequences: List[List[int]],
-    stop_words: List[str],
-) -> StopCondition:
-    """
-    Determines whether the token generation should stop based on predefined
-    conditions.
+    def __call__(self, tool_calls):
+        if not tool_calls:
+            return []
 
-    Args:
-        tokens (List[int]): The current sequence of generated tokens.
-        eos_token_ids (set): The token IDs that represents the
-          end-of-sequence. If the last token in ``tokens`` is in the set,
-          the generation should stop.
-        stop_id_sequences (List[List[[int]]): A list of integer lists, each
-          representing a sequence of token IDs. If the end of the `tokens`
-          list matches any of these sequences, the generation should stop.
-        stop_words (List[str]): The stop words that correspond to the
-            ``stop_id_sequences``.
-
-    Returns:
-        StopCondition: A named tuple indicating whether the stop condition has
-          been met (`stop_met`) and how many tokens should be trimmed from the
-          end if it has (`trim_length`) as well as the text that should be
-          trimmed.
-    """
-    if tokens and tokens[-1] in eos_token_ids:
-        return StopCondition(stop_met=True, trim_length=0, trim_text_length=0)
-
-    for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
-        if len(tokens) >= len(stop_ids):
-            if tokens[-len(stop_ids) :] == stop_ids:
-                return StopCondition(
-                    stop_met=True,
-                    trim_length=len(stop_ids),
-                    trim_text_length=len(stop_word),
+        result = []
+        for tool_text in tool_calls:
+            try:
+                parsed = self._tool_parser(tool_text, self._tools)
+            except (ValueError, json.JSONDecodeError) as e:
+                logging.warning(
+                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
+                    f"tool text was likely truncated mid-generation."
                 )
-
-    return StopCondition(stop_met=False, trim_length=0, trim_text_length=0)
-
-
-def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
-    """
-    Checks if a suffix of s1 has overlap with a prefix of s2
-
-    Args:
-        s1 (Sequence): The first sequence
-        s2 (Sequence): The second sequence
-
-    Returns:
-        bool: If the two sequences have overlap
-    """
-    max_overlap = min(len(s1), len(s2))
-    return any(s1[-i:] == s2[:i] for i in range(1, max_overlap + 1))
+                continue
+            if not isinstance(parsed, list):
+                parsed = [parsed]
+            result.extend(self._format(tc) for tc in parsed)
+        return result
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -176,7 +102,7 @@ def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
         "assistant": "ASSISTANT: ",
         "stop": "\n",
     }
-    role_mapping = role_mapping if role_mapping is not None else default_role_mapping
+    role_mapping = role_mapping or default_role_mapping
 
     prompt = ""
     for line in messages:
@@ -206,7 +132,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message.get("content", None)
+        content = message.get("content")
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
@@ -216,10 +142,11 @@ def process_message_content(messages):
             message["content"] = "".join(text_fragments)
         elif content is None:
             message["content"] = ""
-        if tool_calls := message.get("tool_calls", False):
+
+        if tool_calls := message.get("tool_calls"):
             for tool_call in tool_calls:
-                if func := tool_call.get("function", False):
-                    if args := func.get("arguments", False):
+                if func := tool_call.get("function"):
+                    if args := func.get("arguments"):
                         func["arguments"] = json.loads(args)
 
 
@@ -281,15 +208,11 @@ class CompletionRequest:
 @dataclass
 class GenerationContext:
     has_tool_calling: bool
-    tool_call_start: str
-    tool_call_end: str
-    tool_parser: Callable[[str, Any], Dict]
     has_thinking: bool
-    think_start_id: int
-    think_end_id: int
-    think_end: str
-    eos_token_ids: set
-    stop_token_sequences: List[List[int]]
+    tool_parser: Callable[[str, Any], Dict]
+
+    sequences: Dict[Tuple[int], str]
+
     prompt: List[int]
     prompt_cache_count: int = -1
 
@@ -303,9 +226,27 @@ class GenerationContext:
 class Response:
     text: str
     token: int
+    state: str
+    match: Tuple[int]
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+
+
+def _process_control_tokens(ctx, token_stream):
+    buffer_size = max(len(s) for s in ctx.sequences)
+    buffered_stream = deque()
+
+    for tok in token_stream:
+        buffered_stream.append(tok)
+        if tok.match is not None:
+            popped = [buffered_stream.pop() for _ in tok.match]
+            for t in reversed(popped):
+                buffered_stream.append(replace(t, text=""))
+        if len(buffered_stream) >= buffer_size:
+            yield buffered_stream.popleft()
+    while len(buffered_stream) > 0:
+        yield buffered_stream.popleft()
 
 
 class TimeBudget:
@@ -314,7 +255,6 @@ class TimeBudget:
         self._budget = budget
         self._iterations = iterations
         self._sync_frequency = sync_frequency
-
         self._start = None
         self._current_iterations = None
         self._loops = 0
@@ -332,20 +272,21 @@ class TimeBudget:
             return None
 
         self._current_iterations += 1
-        if self._current_iterations > self._iterations:
-            self._loops += 1
-            self._time_spent += time.time() - self._start
-            if self._loops % self._sync_frequency == 0:
-                with mx.stream(get_generation_stream()):
-                    loop_time = mx.distributed.all_sum(self._time_spent).item()
-                avg_loop_time = loop_time / (
-                    mx.distributed.init().size() * self._sync_frequency
-                )
-                factor = self._budget / avg_loop_time
-                self._iterations = max(round(self._iterations * factor), 1)
-                self._loops = 0
-                self._time_spent = 0
-            raise StopIteration()
+        if self._current_iterations <= self._iterations:
+            return None
+
+        self._loops += 1
+        self._time_spent += time.time() - self._start
+        if self._loops % self._sync_frequency == 0:
+            loop_time = mx.distributed.all_sum(self._time_spent).item()
+            avg_loop_time = loop_time / (
+                mx.distributed.init().size() * self._sync_frequency
+            )
+            factor = self._budget / avg_loop_time
+            self._iterations = max(round(self._iterations * factor), 1)
+            self._loops = 0
+            self._time_spent = 0
+        raise StopIteration()
 
 
 class ModelProvider:
@@ -365,94 +306,92 @@ class ModelProvider:
         )
         self.is_distributed = group.size() > 1
 
-        # Preload the default model if it is provided
-        self.default_model_map = {}
-        if self.cli_args.model is not None:
-            self.default_model_map[self.cli_args.model] = "default_model"
-            self.load(self.cli_args.model, draft_model_path="default_model")
+        # Maps model and adapter paths the actual paths to be used. Used to
+        # map 'default_model' to the provided model by cli argument but could
+        # be used for more in the future.
+        self._model_map = {}
+        self._adapter_map = {}
+        self._draft_model_map = {}
+        self._model_map["default_model"] = self.cli_args.model
+        self._adapter_map["default_model"] = self.cli_args.adapter_path
+        self._draft_model_map["default_model"] = self.cli_args.draft_model
 
-    # Added in adapter_path to load dynamically
-    def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self.default_model_map.get(model_path, model_path)
-        if self.model_key == (model_path, adapter_path, draft_model_path):
-            return self.model, self.tokenizer
+        # Build the tokenizer config for later use in load
+        self._tokenizer_config = {
+            "trust_remote_code": True if cli_args.trust_remote_code else None
+        }
+        if cli_args.chat_template:
+            self._tokenizer_config["chat_template"] = cli_args.chat_template
+
+    def _load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.is_distributed and (
+            adapter_path is not None or draft_model_path is not None
+        ):
+            raise ValueError(
+                "Loading with adapters or draft models not supported in distributed mode"
+            )
 
         # Remove the old model if it exists.
+        self.model_key = None
         self.model = None
         self.tokenizer = None
-        self.model_key = None
         self.draft_model = None
 
-        # Building tokenizer_config
-        tokenizer_config = {
-            "trust_remote_code": True if self.cli_args.trust_remote_code else None
-        }
-        if self.cli_args.chat_template:
-            tokenizer_config["chat_template"] = self.cli_args.chat_template
-
-        if model_path == "default_model":
-            if self.cli_args.model is None:
-                raise ValueError(
-                    "A model path has to be given as a CLI "
-                    "argument or in the HTTP request"
-                )
-            adapter_path = adapter_path or self.cli_args.adapter_path
-            # TODO: Generalize distributed load
-            if self.is_distributed:
-                model, tokenizer = sharded_load(
-                    self.cli_args.model, self.pipeline_group, self.tensor_group
-                )
-            else:
-                model, tokenizer = load(
-                    self.cli_args.model,
-                    adapter_path=adapter_path,
-                    tokenizer_config=tokenizer_config,
-                )
+        # Load the model and tokenizer
+        if self.is_distributed:
+            model, tokenizer = sharded_load(
+                model_path,
+                pipeline_group=self.pipeline_group,
+                tensor_group=self.tensor_group,
+                tokenizer_config=self._tokenizer_config,
+            )
         else:
-            # TODO: Generalize distributed load
-            if self.is_distributed:
-                model, tokenizer = sharded_load(
-                    model_path, self.pipeline_group, self.tensor_group
-                )
-            else:
-                model, tokenizer = load(
-                    model_path,
-                    adapter_path=adapter_path,
-                    tokenizer_config=tokenizer_config,
-                )
+            model, tokenizer = load(
+                model_path,
+                adapter_path=adapter_path,
+                tokenizer_config=self._tokenizer_config,
+            )
 
+        # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path, draft_model_path)
-        self.model = model
-        self.tokenizer = tokenizer
-
-        def validate_draft_tokenizer(draft_tokenizer):
-            # Check if tokenizers are compatible
+        # Load the draft model for speculative decoding
+        draft_model = None
+        if draft_model_path is not None:
+            draft_model, draft_tokenizer = load(draft_model_path)
             if draft_tokenizer.vocab_size != tokenizer.vocab_size:
                 logging.warning(
                     "Draft model tokenizer does not match model tokenizer. "
                     "Speculative decoding may not work as expected."
                 )
 
-        # Load draft model if specified
-        if (
-            draft_model_path == "default_model"
-            and self.cli_args.draft_model is not None
-        ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
-            validate_draft_tokenizer(draft_tokenizer)
+        # Compute batchability
+        is_batchable = draft_model is None
+        is_batchable = is_batchable and all(
+            hasattr(c, "merge") for c in make_prompt_cache(model)
+        )
 
-        elif draft_model_path is not None and draft_model_path != "default_model":
-            self.draft_model, draft_tokenizer = load(draft_model_path)
-            validate_draft_tokenizer(draft_tokenizer)
+        # Update the member variables
+        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model = model
+        self.tokenizer = tokenizer
+        self.draft_model = draft_model
+        self.is_batchable = is_batchable
 
-        if self.draft_model is None and not getattr(self.cli_args, "no_batch", False):
-            self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
-            )
+    def load_default(self):
+        if self._model_map["default_model"] is not None:
+            self.load("default_model", None, "default_model")
+
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        model_path = self._model_map.get(model_path, model_path)
+        adapter_path = self._adapter_map.get(model_path, adapter_path)
+        draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
+
+        model_key = (model_path, adapter_path, draft_model_path)
+        if self.model_key != model_key:
+            self._load(*model_key)
 
         return self.model, self.tokenizer
 
@@ -484,17 +423,17 @@ def _make_logits_processors(args):
     )
 
 
-def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, Any]]:
-    """Returns info dicts for the top `top_logprobs` tokens from `logprobs`"""
-    if top_logprobs <= 0:
+def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
+    """Returns info dicts for the top `top_n` tokens from `logprobs`"""
+    if top_n <= 0:
         return ()
-    sorted_indices = mx.argpartition(-logprobs, kth=top_logprobs - 1)
-    top_indices = sorted_indices[:top_logprobs].tolist()
-    top_logprobs = logprobs[top_indices].tolist()
+    sorted_indices = mx.argpartition(-logprobs, kth=top_n - 1)
+    top_indices = sorted_indices[:top_n].tolist()
+    top_probs = logprobs[top_indices].tolist()
     txts = tokenizer.convert_ids_to_tokens(top_indices)
     return tuple(
         {"id": i, "token": s, "logprob": g}
-        for i, s, g in zip(top_indices, txts, top_logprobs)
+        for i, s, g in zip(top_indices, txts, top_probs)
     )
 
 
@@ -503,36 +442,41 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
-        self._kv_quant_config = getattr(
-            model_provider.cli_args, "kv_quant_config", None
+        self._state_machine_cache = {}
+        self._turbo_kv_bits = getattr(
+            model_provider.cli_args, "turbo_kv_bits", None
         )
-        self._kv_quant_start = getattr(model_provider.cli_args, "quantized_kv_start", 0)
+        self._turbo_fp16_layers = getattr(
+            model_provider.cli_args, "turbo_fp16_layers", 1
+        )
+        self._turbo_v_bits = getattr(
+            model_provider.cli_args, "turbo_v_bits", None
+        )
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        # Generation runs on the main thread (see run()).
-        # MLX streams are thread-affine; async_eval requires the
-        # stream that was active when the model was loaded.
-
-    def _store_cache(self, model_key, cache_key, cache, **kwargs):
-        """Optionally quantize KV cache before inserting into LRU."""
-        cache = _maybe_quantize_cache(
-            cache, self._kv_quant_config, min_tokens=self._kv_quant_start
-        )
-        self.prompt_cache.insert_cache(model_key, cache_key, cache, **kwargs)
+        self._generation_thread = Thread(target=self._generate)
+        self._generation_thread.start()
 
     def stop_and_join(self):
         self._stop = True
+        self._generation_thread.join()
 
     def join(self):
-        pass
+        self._generation_thread.join()
 
     def _log_cache_stats(self):
-        ncaches = len(self.prompt_cache)
-        nbytes = self.prompt_cache.nbytes
-        logging.info(f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB")
+        n_sequences = len(self.prompt_cache)
+        n_bytes = self.prompt_cache.nbytes
+        logging.info(f"Prompt Cache: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB")
+        for cache_type, stats in self.prompt_cache.stats_by_type().items():
+            n_sequences = stats["n_sequences"]
+            n_bytes = stats["n_bytes"]
+            logging.info(
+                f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
+            )
 
     def _next_request(self, timeout=None):
         request = None
@@ -544,31 +488,27 @@ class ResponseGenerator:
                     request = self.requests.get_nowait()
             except QueueEmpty:
                 pass
-
         return self._share_request(request)
 
     def _share_object(self, obj):
         if not self._is_distributed:
             return obj
 
-        with mx.stream(get_generation_stream()):
-            if self._rank == 0:
-                if obj is None:
-                    mx.eval(mx.distributed.all_sum(0))
-                    return None
-                else:
-                    data = mx.array(pickle.dumps(obj))
-                    mx.eval(mx.distributed.all_sum(data.size))
-                    mx.eval(mx.distributed.all_sum(data))
-                    return obj
-            else:
-                size = mx.distributed.all_sum(0).item()
-                if size == 0:
-                    return None
-                else:
-                    data = mx.zeros(size, dtype=mx.uint8)
-                    data = mx.distributed.all_sum(data)
-                    return pickle.loads(data)
+        if self._rank == 0:
+            if obj is None:
+                mx.eval(mx.distributed.all_sum(0))
+                return None
+            data = mx.array(pickle.dumps(obj))
+            mx.eval(mx.distributed.all_sum(data.size))
+            mx.eval(mx.distributed.all_sum(data))
+            return obj
+        else:
+            size = mx.distributed.all_sum(0).item()
+            if size == 0:
+                return None
+            data = mx.zeros(size, dtype=mx.uint8)
+            data = mx.distributed.all_sum(data)
+            return pickle.loads(data)
 
     def _share_request(self, request):
         if not self._is_distributed:
@@ -583,6 +523,19 @@ class ResponseGenerator:
         return rq, *shareable
 
     def _tokenize(self, tokenizer, request, args):
+        """Tokenize a request and split the prompt into segments.
+
+        Returns a tuple
+
+          * prompt - Full list of tokens
+          * segments - A list of lists of tokens. Up to 3 segments that
+            correspond to system prompt, context, thinking tail.
+          * segment_types - A string per segment indicating if the segment is a
+            system prompt or a user prompt or nothing special.
+          * initial state - A string that contains the initial state of the
+            state machine (normal or thinking depending on whether we have tail
+            or not)
+        """
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
@@ -601,45 +554,155 @@ class ResponseGenerator:
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
                     chat_template_args.update(args.chat_template_kwargs)
-                return tokenizer.apply_chat_template(
-                    messages,
+                template_kwargs = dict(
                     tools=tools,
-                    add_generation_prompt=True,
                     tokenize=True,
                     **chat_template_args,
                 )
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
             else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+                prompt = tokenizer.encode(convert_chat(messages, role_mapping))
+                return prompt, [prompt], ["assistant"], "normal"
         else:
-            return tokenizer.encode(request.prompt)
+            prompt = tokenizer.encode(request.prompt)
+            return prompt, [prompt], ["assistant"], "normal"
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
-        if request.request_type != "chat":
-            return False, -1
-        if request.messages[-1]["role"] != "user":
-            return False, -1
+        # If we are here it means we have a chat request so we need to search
+        # for segments for better cache management.
 
-        # Save the KV cache at the end of the prompt just before
-        # the think start token which will likely be removed in the
-        # next turn.
-        prompt_checkpoint = -1
+        # Choose the initial state among only reasoning or normal
+        initial_state = "normal"
         if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt)) - 1, 1):
-                if prompt[-i] == tokenizer.think_start_id:
-                    prompt_checkpoint = -i - 1
-                    break
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
 
-        return True, prompt_checkpoint
+        # It is not a user message so no segmentation needed.
+        if messages[-1]["role"] != "user":
+            return prompt, [prompt], ["assistant"], initial_state
+
+        segments = []
+        segment_types = []
+
+        # Find where the system prompt ends and add it as a segment.
+        num_system = 0
+        sys_end = 0
+        for m in messages:
+            if m["role"] == "system":
+                num_system += 1
+            else:
+                break
+        if num_system > 0:
+            sys_tokens = tokenizer.apply_chat_template(
+                messages[:num_system] + [{"role": "user", "content": ""}],
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
+                if a != b:
+                    sys_end = i
+                    break
+            if sys_end > 0 and sys_end < len(prompt):
+                segments.append(prompt[:sys_end])
+                segment_types.append("system")
+
+        # Find a tail segment that contains thinking tokens (small up to 11
+        # tokens)
+        tail_start = len(prompt)
+        if tokenizer.has_thinking:
+            think_start = tokenizer.rfind_think_start(prompt, start=tail_start - 11)
+            if think_start >= 0:
+                tail_start = think_start
+
+        # Finalize the segments and return
+        if sys_end < tail_start:
+            segments.append(prompt[sys_end:tail_start])
+            segment_types.append("user")
+        if tail_start < len(prompt):
+            segments.append(prompt[tail_start:])
+            segment_types.append("assistant")
+        if not segments:
+            segments = [prompt]
+            segment_types = ["assistant"]
+
+        return prompt, segments, segment_types, initial_state
+
+    def _make_state_machine(
+        self, model_key, tokenizer, stop_words, initial_state="normal"
+    ):
+        """Make a new SequenceStateMachine or fetch it if we 've made it before.
+
+        Return also a dictionary that maps the token sequences in the state
+        machine to their strings.
+        """
+        cache_key = (model_key, tuple(stop_words), initial_state)
+        rs = self._state_machine_cache.get(cache_key)
+        if rs is not None:
+            return rs
+
+        # Will hold the state machine transitions and the sequences map to
+        # strings.
+        transitions = {}
+        sequences = {}
+
+        # Add all the stop sequences
+        common_stops = []
+        for t in tokenizer.eos_token_ids:
+            sequences[(t,)] = tokenizer.convert_ids_to_tokens(t)
+            common_stops.append(((t,), None))
+        for w in stop_words:
+            t = tuple(tokenizer.encode(w, add_special_tokens=False))
+            sequences[t] = w
+            common_stops.append((t, None))
+
+        # From normal to stop
+        transitions["normal"] = list(common_stops)
+
+        # Reasoning related transitions
+        if tokenizer.has_thinking:
+            ts = tokenizer.think_start_tokens
+            te = tokenizer.think_end_tokens
+            transitions["normal"].append((ts, "reasoning"))
+            transitions["reasoning"] = [(te, "normal")]
+            transitions["reasoning"].extend(common_stops)
+            sequences[ts] = tokenizer.think_start
+            sequences[te] = tokenizer.think_end
+
+        # Tool calling relating transitions
+        if tokenizer.has_tool_calling:
+            ts = tokenizer.tool_call_start_tokens
+            te = tokenizer.tool_call_end_tokens
+            transitions["normal"].append((ts, "tool"))
+            transitions["tool"] = [(te, "normal")] if te else []
+            transitions["tool"].extend(common_stops)
+            sequences[ts] = tokenizer.tool_call_start
+            if te:
+                sequences[te] = tokenizer.tool_call_end
+
+        sm = SequenceStateMachine(transitions, initial=initial_state)
+        if len(self._state_machine_cache) > 100:
+            self._state_machine_cache.clear()
+        self._state_machine_cache[cache_key] = (sm, sequences)
+
+        return sm, sequences
 
     def _is_batchable(self, args):
-        if not self.model_provider.is_batchable:
-            return False
-        if args.seed is not None:
-            return False
-
-        return True
+        return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
+        # Local thread stream that we 'll pass to the BatchGenerator to make
+        # sure that all generation runs in the same stream as the
+        # synchronization messages.
+        generation_stream = mx.default_stream(mx.default_device())
+
+        # Load the default model if it is given
+        self.model_provider.load_default()
+
         current_model = None
         current_sampling = None
         current_tokenizer = None
@@ -655,32 +718,6 @@ class ResponseGenerator:
                 return unprocessed_requests.pop()
             else:
                 return self._next_request(timeout)
-
-        def progress_callback(info):
-            for uid, processed, total in info:
-                if uid in batch_results:
-                    batch_results[uid]["rqueue"].put((min(processed, total), total))
-
-        def checkpoint_callback(prompts):
-            for uid, prompt_end, cache in prompts:
-                rs = batch_results[uid]
-                if not rs["checkpoint"]:
-                    continue
-                # cache is a generator -- materialize before checking,
-                # extract() can crash on uninitialized sub-caches
-                try:
-                    cache = list(cache)
-                except (TypeError, AttributeError) as e:
-                    logging.debug(f"Skipping checkpoint: {e}")
-                    continue
-                if any(c.empty() for c in cache):
-                    continue
-                self._store_cache(
-                    current_model_key,
-                    rs["cache_key"][:-prompt_end],
-                    cache,
-                    cache_type="user",
-                )
 
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
@@ -707,58 +744,59 @@ class ResponseGenerator:
                     and self._is_batchable(args)
                 ):
                     try:
-                        prompt = self._tokenize(current_tokenizer, request, args)
+                        prompt, segments, segment_types, initial_state = self._tokenize(
+                            current_tokenizer, request, args
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
 
-                    ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        tool_call_start=tokenizer.tool_call_start,
-                        tool_call_end=tokenizer.tool_call_end,
-                        tool_parser=tokenizer.tool_parser,
-                        has_thinking=tokenizer.has_thinking,
-                        think_start_id=tokenizer.think_start_id,
-                        think_end=tokenizer.think_end,
-                        think_end_id=tokenizer.think_end_id,
-                        eos_token_ids=tokenizer.eos_token_ids,
-                        stop_token_sequences=[
-                            tokenizer.encode(stop_word, add_special_tokens=False)
-                            for stop_word in args.stop_words
-                        ],
-                        prompt=prompt,
+                    sm, sequences = self._make_state_machine(
+                        self.model_provider.model_key,
+                        tokenizer,
+                        args.stop_words,
+                        initial_state,
                     )
-                    rqueue.put(ctx)
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
-                    ctx.prompt_cache_count = len(prompt) - len(rest)
-                    if cache is None or not cache:
-                        cache = make_prompt_cache(self.model_provider.model)
-                    elif self._kv_quant_config is not None:
-                        # Dequantize for batch merge compatibility
-                        cache = _maybe_dequantize_cache(cache)
+                    prompt_cache_count = len(prompt) - len(rest)
+                    N = prompt_cache_count
+                    while N > 0:
+                        if N >= len(segments[0]):
+                            N -= len(segments.pop(0))
+                            segment_types.pop(0)
+                        else:
+                            segments[0] = segments[0][N:]
+                            break
 
-                    do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
+                    ctx = GenerationContext(
+                        has_tool_calling=tokenizer.has_tool_calling,
+                        has_thinking=tokenizer.has_thinking,
+                        tool_parser=tokenizer.tool_parser,
+                        sequences=sequences,
+                        prompt=prompt,
+                        prompt_cache_count=prompt_cache_count,
                     )
+                    rqueue.put(ctx)
 
-                    (uid,) = batch_generator.insert(
-                        [rest],
-                        args.max_tokens,
+                    (uid,) = batch_generator.insert_segments(
+                        segments=[segments],
+                        max_tokens=[args.max_tokens],
                         caches=[cache],
+                        all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        prompt_checkpoints=[checkpoint_position],
+                        state_machines=[sm],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
-                        "cache_key": prompt[:],
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
-                        "checkpoint": do_checkpoint,
+                        "segment_types": segment_types[::-1],
+                        "top_logprobs": args.top_logprobs,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -791,12 +829,10 @@ class ResponseGenerator:
                     batch_results = {}
                     batch_generator = BatchGenerator(
                         model,
-                        stop_tokens=tokenizer.eos_token_ids,
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
-                        prompt_progress_callback=progress_callback,
-                        prompt_checkpoint_callback=checkpoint_callback,
+                        stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -823,32 +859,61 @@ class ResponseGenerator:
 
                 uids_to_remove = []
                 for _ in self._time_budget:
-                    responses = batch_generator.next()
-                    if not responses:
+                    prompt_responses, gen_responses = batch_generator.next()
+                    if not prompt_responses and not gen_responses:
                         break
 
-                    for r in responses:
+                    # Progress report for prompt processing
+                    for r in prompt_responses:
                         result = batch_results[r.uid]
-                        result["cache_key"].append(r.token)
-                        if r.finish_reason != "stop":
-                            result["detokenizer"].add_token(r.token)
+                        result["rqueue"].put(r.progress)
+                        if result["ctx"]._should_stop:
+                            uids_to_remove.append(r.uid)
 
+                    # Save the caches at end of segments
+                    eos_ids = [
+                        r.uid
+                        for r in prompt_responses
+                        if r.end_of_segment
+                        and not r.end_of_prompt
+                        and batch_results[r.uid]["segment_types"]
+                    ]
+                    caches = batch_generator.extract_cache(eos_ids)
+                    for uid, (cache, cache_key) in caches.items():
+                        self.prompt_cache.insert_cache(
+                            self.model_provider.model_key,
+                            cache_key[:],
+                            cache,
+                            cache_type=batch_results[uid]["segment_types"].pop(),
+                        )
+                    del caches
+
+                    for r in gen_responses:
+                        result = batch_results[r.uid]
+                        result["detokenizer"].add_token(r.token)
                         result["rqueue"].put(
                             Response(
                                 result["detokenizer"].last_segment,
                                 r.token,
+                                r.current_state,
+                                r.match_sequence,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
                                 _format_top_logprobs(
-                                    r.logprobs, args.top_logprobs, current_tokenizer
+                                    r.logprobs,
+                                    result["top_logprobs"],
+                                    current_tokenizer,
                                 ),
                             )
                         )
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self._store_cache(
-                                current_model_key, result["cache_key"], r.prompt_cache
+                            self.prompt_cache.insert_cache(
+                                current_model_key,
+                                r.all_tokens[:],
+                                r.prompt_cache,
+                                cache_type="assistant",
                             )
                             del batch_results[r.uid]
 
@@ -857,51 +922,18 @@ class ResponseGenerator:
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
-                    with mx.stream(get_generation_stream()):
-                        caches = batch_generator.remove(
-                            uids_to_remove, return_prompt_caches=True
-                        )
-                        for uid, prompt_cache in caches.items():
-                            if uid not in batch_results:
-                                continue
-                            result = batch_results[uid]
-                            self._store_cache(
-                                current_model_key, result["cache_key"], prompt_cache
-                            )
-                            del batch_results[uid]
+                    batch_generator.remove(uids_to_remove)
+                    for uid in uids_to_remove:
+                        # It may have already been removed during
+                        # generation
+                        batch_results.pop(uid, None)
 
     def _serve_single(self, request):
         rqueue, request, args = request
 
-        # Progress state shared between callback and try block
-        _checkpoint_state = {"last": 0, "ctx": None, "cache_key": None, "cache": None}
-        _checkpoint_interval = 32768  # save checkpoint every 32K tokens
-
+        # Define the progress callback
         def progress(tokens_processed, tokens_total):
             rqueue.put((tokens_processed, tokens_total))
-            s = _checkpoint_state
-            if s["cache"] is None or tokens_processed <= 0:
-                return
-            n_cached = s["ctx"].prompt_cache_count + tokens_processed
-            # Save at the END of prefill -- cache offset matches key length
-            # exactly (no off-by-one from generated tokens).
-            # Also save periodic checkpoints during long prefills.
-            should_save = tokens_processed == tokens_total or (  # prefill complete
-                tokens_processed - s["last"] >= _checkpoint_interval
-                and tokens_processed < tokens_total
-            )
-            if should_save:
-                s["last"] = tokens_processed
-                try:
-                    self.prompt_cache.insert_cache(
-                        self.model_provider.model_key,
-                        s["cache_key"][:n_cached],
-                        s["cache"],
-                        cache_type="user",
-                    )
-                    logging.info(f"Prefill checkpoint saved: {n_cached} tokens")
-                except Exception as e:
-                    logging.debug(f"Checkpoint save failed: {e}")
 
         try:
             # Load the model and tokenizer
@@ -909,24 +941,22 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
-            # Prepare the prompt
-            prompt = self._tokenize(tokenizer, request, args)
+            # Prepare the prompt and state machine
+            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            sm, sequences = self._make_state_machine(
+                self.model_provider.model_key,
+                tokenizer,
+                args.stop_words,
+                initial_state=initial_state,
+            )
+            sm_state = sm.make_state()
 
             # Start the generation context
             ctx = GenerationContext(
-                has_tool_calling=tokenizer.has_tool_calling,
-                tool_call_start=tokenizer.tool_call_start,
-                tool_call_end=tokenizer.tool_call_end,
-                tool_parser=tokenizer.tool_parser,
                 has_thinking=tokenizer.has_thinking,
-                think_start_id=tokenizer.think_start_id,
-                think_end=tokenizer.think_end,
-                think_end_id=tokenizer.think_end_id,
-                eos_token_ids=tokenizer.eos_token_ids,
-                stop_token_sequences=[
-                    tokenizer.encode(stop_word, add_special_tokens=False)
-                    for stop_word in args.stop_words
-                ],
+                has_tool_calling=tokenizer.has_tool_calling,
+                tool_parser=tokenizer.tool_parser,
+                sequences=sequences,
                 prompt=prompt,
             )
             rqueue.put(ctx)
@@ -947,23 +977,14 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                cache = make_prompt_cache(
+                    self.model_provider.model,
+                    turbo_kv_bits=self._turbo_kv_bits,
+                    turbo_fp16_layers=self._turbo_fp16_layers,
+                    turbo_v_bits=self._turbo_v_bits,
+                )
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
-            else:
-                if self._kv_quant_config is not None:
-                    cache = _maybe_dequantize_cache(cache)
-                # Exact cache hit: all prompt tokens matched, nothing to prefill.
-                # Trim last token from cache and re-process it so
-                # generate_step has at least one prompt token.
-                if len(rest) == 0:
-                    trim_prompt_cache(cache, 1)
-                    rest = prompt[-1:]
-
-            # Enable prefill checkpoints now that cache/ctx are ready
-            _checkpoint_state["ctx"] = ctx
-            _checkpoint_state["cache_key"] = cache_key
-            _checkpoint_state["cache"] = cache
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -979,12 +1000,18 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
+                finish_reason = gen.finish_reason
+                sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
+                if match_sequence is not None and current_state is None:
+                    finish_reason = "stop"
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
+                        current_state,
+                        match_sequence,
                         gen.logprobs[gen.token].item(),
-                        gen.finish_reason,
+                        finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
                         ),
@@ -997,10 +1024,15 @@ class ResponseGenerator:
                         raise NotImplementedError()
                     break
 
+                if finish_reason is not None:
+                    break
+
             rqueue.put(None)
 
             # Save the KV cache again
-            self._store_cache(self.model_provider.model_key, cache_key, cache)
+            self.prompt_cache.insert_cache(
+                self.model_provider.model_key, cache_key, cache
+            )
 
         except Exception as e:
             rqueue.put(e)
@@ -1031,7 +1063,7 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
-        return ctx, _inner()
+        return ctx, _process_control_tokens(ctx, _inner())
 
     @property
     def cli_args(self):
@@ -1126,11 +1158,18 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        indent = "\t"  # Backslashes can't be inside of f-strings
-        logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        assert isinstance(
-            self.body, dict
-        ), f"Request should be dict, but got {type(self.body)}"
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            debug_body = json.dumps(self.body, indent="\t")
+            logging.debug(f"Incoming Request Body: {debug_body}")
+        if not isinstance(self.body, dict):
+            debug_body = json.dumps(self.body, indent="\t")
+            logging.error(f"Invalid Request Body: {debug_body}")
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
+            )
+            return
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -1176,87 +1215,60 @@ class APIHandler(BaseHTTPRequestHandler):
         request = request_factories[self.path]()
         self.handle_completion(request, stop_words)
 
+    def _validate(
+        self,
+        name,
+        expected_type,
+        min_val=None,
+        max_val=None,
+        optional=False,
+        whitelist=None,
+    ):
+        value = getattr(self, name)
+        if optional and value is None:
+            return
+        if not isinstance(value, expected_type):
+            try:
+                allowed = tuple(et.__name__ for et in expected_type)
+            except TypeError:
+                allowed = expected_type.__name__
+            raise ValueError(f"{name} must be of type {allowed}")
+        if whitelist is not None and value in whitelist:
+            return
+        if min_val is not None and value < min_val:
+            raise ValueError(f"{name} must be at least {min_val}")
+        if max_val is not None and value > max_val:
+            raise ValueError(f"{name} must be at most {max_val}")
+
     def validate_model_parameters(self):
-        """
-        Validate the model parameters passed in the request for the correct types and values.
-        """
-        if not isinstance(self.stream, bool):
-            raise ValueError("stream must be a boolean")
-
-        if not isinstance(self.max_tokens, int) or self.max_tokens < 0:
-            raise ValueError("max_tokens must be a non-negative integer")
-
-        if not isinstance(self.temperature, (float, int)) or self.temperature < 0:
-            raise ValueError("temperature must be a non-negative float")
-
-        if not isinstance(self.top_p, (float, int)) or self.top_p < 0 or self.top_p > 1:
-            raise ValueError("top_p must be a float between 0 and 1")
-
-        if not isinstance(self.top_k, int) or self.top_k < 0:
-            raise ValueError("top_k must be a non-negative integer")
-
-        if not isinstance(self.min_p, (float, int)) or self.min_p < 0 or self.min_p > 1:
-            raise ValueError("min_p must be a float between 0 and 1")
-
-        if not isinstance(self.num_draft_tokens, int) or self.num_draft_tokens < 0:
-            raise ValueError("num_draft_tokens must be a non-negative integer")
-
-        if (
-            not isinstance(self.repetition_penalty, (float, int))
-            or self.repetition_penalty < 0
-        ):
-            raise ValueError("repetition_penalty must be a non-negative float")
-        if (
-            not isinstance(self.repetition_context_size, int)
-            or self.repetition_context_size < 0
-        ):
-            raise ValueError("repetition_context_size must be a non-negative integer")
-        if not isinstance(self.presence_penalty, (float, int)):
-            raise ValueError("Presence penalty must be must be a float")
-        if (
-            not isinstance(self.presence_context_size, int)
-            or self.presence_context_size < 0
-        ):
-            raise ValueError("presence_context_size must be a non-negative integer")
-        if not isinstance(self.frequency_penalty, (float, int)):
-            raise ValueError("Presence penalty must be must be a float")
-        if (
-            not isinstance(self.frequency_context_size, int)
-            or self.frequency_context_size < 0
-        ):
-            raise ValueError("frequency_context_size must be a non-negative integer")
-
-        if not isinstance(self.logprobs, bool):
-            raise ValueError("logprobs must be a boolean")
-
-        if self.top_logprobs != -1 and not (0 < self.top_logprobs <= 10):
-            raise ValueError(
-                f"top_logprobs must be between 1 and 10 but got {self.top_logprobs:,}"
-            )
+        """Validate that the passed model parameters have correct types and values."""
+        self._validate("stream", bool)
+        self._validate("max_tokens", int, min_val=0)
+        self._validate("temperature", (float, int), min_val=0)
+        self._validate("top_p", (float, int), min_val=0, max_val=1)
+        self._validate("top_k", int, min_val=0)
+        self._validate("min_p", (float, int), min_val=0, max_val=1)
+        self._validate("num_draft_tokens", int, min_val=0)
+        self._validate("repetition_penalty", (float, int), min_val=0)
+        self._validate("repetition_context_size", int, min_val=0)
+        self._validate("presence_penalty", (float, int))
+        self._validate("presence_context_size", int, min_val=0)
+        self._validate("frequency_penalty", (float, int))
+        self._validate("frequency_context_size", int, min_val=0)
+        self._validate("logprobs", bool)
+        self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
+        self._validate("xtc_probability", float, min_val=0, max_val=1)
+        self._validate("xtc_threshold", float, min_val=0, max_val=1)
+        self._validate("requested_model", str)
+        self._validate("adapter", str, optional=True)
+        self._validate("seed", int, optional=True)
+        self._validate("logit_bias", dict, optional=True)
 
         if self.logit_bias is not None:
-            if not isinstance(self.logit_bias, dict):
-                raise ValueError("logit_bias must be a dict of int to float")
-
             try:
-                self.logit_bias = {int(k): v for k, v in self.logit_bias.items()}
+                self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
             except ValueError:
                 raise ValueError("logit_bias must be a dict of int to float")
-        if not (
-            isinstance(self.xtc_probability, float)
-            and 0.00 <= self.xtc_probability <= 1.00
-        ):
-            raise ValueError(f"xtc_probability must be a float between 0.00 and 1.00")
-        if not (
-            isinstance(self.xtc_threshold, float) and 0.00 <= self.xtc_threshold <= 0.50
-        ):
-            raise ValueError(f"xtc_threshold must be a float between 0.00 and 0.5")
-        if not isinstance(self.requested_model, str):
-            raise ValueError("model must be a string")
-        if self.adapter is not None and not isinstance(self.adapter, str):
-            raise ValueError("adapter must be a string")
-        if self.seed is not None and not isinstance(self.seed, int):
-            raise ValueError("seed must be an integer")
 
     def generate_response(
         self,
@@ -1353,14 +1365,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            delta: dict[str, any] = {"role": "assistant"}
+            choice[key_name] = {"role": "assistant"}
             if text:
-                delta["content"] = text
+                choice[key_name]["content"] = text
             if reasoning_text:
-                delta["reasoning_content"] = reasoning_text
+                choice[key_name]["reasoning"] = reasoning_text
             if tool_calls:
-                delta["tool_calls"] = tool_calls
-            choice[key_name] = delta
+                choice[key_name]["tool_calls"] = tool_calls
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
@@ -1374,8 +1385,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         Args:
             prompt (List[int]): The tokenized prompt.
-            stop_words (List[str]): A list of stop words passed to the
-                stopping_criteria function
+            stop_words (List[str]): A list of stop words
         """
         args = GenerationArguments(
             model=ModelDescription(
@@ -1409,21 +1419,14 @@ class APIHandler(BaseHTTPRequestHandler):
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
+        # Keep connection allive during long prompt processing (and also log
+        # the progress)
+        def keepalive_callback(processed, total):
+            logging.info(f"Prompt processing progress: {processed}/{total}")
             if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
+                msg = f": keepalive {processed}/{total}\n\n".encode()
+                self.wfile.write(msg)
+                self.wfile.flush()
 
         # Create the token generator
         try:
@@ -1435,7 +1438,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
         # Prepare the headers
@@ -1447,222 +1450,120 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
-        # Variables to save the tool calls in as they are being generated by
-        # the model.
-        in_tool_call = False
-        made_tool_call = False
-        tool_calls = []
-        tool_text = ""
-        tool_idx = 0
+        # Tool call formatter
+        tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
-        def format_tool_call(tool_call):
-            nonlocal tool_idx
-            tool_call_id = tool_call.pop("id", None) or str(uuid.uuid4())
-            tool_call["arguments"] = json.dumps(
-                tool_call["arguments"], ensure_ascii=False
-            )
-            out = {
-                "function": tool_call,
-                "type": "function",
-                "id": tool_call_id,
-            }
-            if self.stream:
-                out["index"] = tool_idx
-                tool_idx += 1
-            return out
-
-        def parse_tools(tool_calls):
-            if not tool_calls:
-                return []
-            result = []
-            for tool_text in tool_calls:
-                try:
-                    parsed = ctx.tool_parser(tool_text, request.tools)
-                except Exception as e:
-                    logging.warning(
-                        f"Tool parser failed (type={type(e).__name__}, msg={e!r}), "
-                        f"tool_text={tool_text!r}, skipping tool call"
-                    )
-                    continue
-                if isinstance(parsed, list):
-                    result.extend(format_tool_call(tc) for tc in parsed)
-                else:
-                    result.append(format_tool_call(parsed))
-            return result
-
-        # Start out in reasoning if the model is a reasoning model and the
-        # prompt has an open think token but no closing think token
-        in_reasoning = False
-        if ctx.has_thinking:
-            for i in range(len(ctx.prompt) - 1, -1, -1):
-                if ctx.prompt[i] == ctx.think_end_id:
-                    break
-                elif ctx.prompt[i] == ctx.think_start_id:
-                    in_reasoning = True
-                    break
+        # Variables to save the generated text, tokens, logprobs, tools etc
+        prev_state = None
+        finish_reason = "stop"
         reasoning_text = ""
-
-        # Variables to save the generated tokens and the corresponding probs
+        made_tool_call = False
+        tool_text = ""
+        tool_calls = []
+        text = ""
         tokens = []
         token_logprobs = []
         top_tokens = []
 
-        # Variables to save the generated text
-        text = ""
-        segment = ""
+        try:
+            for gen in response:
+                logging.debug(gen.text)
 
-        # Well finally save the reason for stopping
-        finish_reason = "length"
-        # Process the generated tokens
-        for gen in response:
-
-            # Gather the text in tool calling or text variables
-            if in_reasoning:
-                if gen.text == ctx.think_end:
-                    in_reasoning = False
-                else:
+                # Collect the text according to our current state and state
+                # transitions. Reasoning or tool or normal text.
+                if gen.state == "reasoning":
                     reasoning_text += gen.text
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                made_tool_call = True
-                in_tool_call = True
-            elif in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    tool_calls.append(tool_text)
-                    tool_text = ""
-                    in_tool_call = False
-                else:
+                elif gen.state == "tool":
                     tool_text += gen.text
-            else:
-                text += gen.text
-                segment += gen.text
+                elif gen.state == "normal":
+                    if prev_state == "tool":
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                        made_tool_call = True
+                    text += gen.text
 
-            # Save the token and its logprob
-            tokens.append(gen.token)
-            if args.logprobs:
-                token_logprobs.append(gen.logprob)
+                # Add the tokens and logprobs to the vars.
+                tokens.append(gen.token)
+                if args.logprobs:
+                    token_logprobs.append(gen.logprob)
+                if args.top_logprobs > 0:
+                    top_tokens.append(gen.top_tokens)
 
-            # If requested save the k top logprobs
-            if args.top_logprobs > 0:
-                top_tokens.append(gen.top_tokens)
-
-            # Check if we should stop early
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
-            )
-            if stop_condition.stop_met:
-                finish_reason = "tool_calls" if made_tool_call else "stop"
-                ctx.stop()
-                last_token = tokens[-1] if tokens else None
-                is_eos = (
-                    last_token in ctx.eos_token_ids if last_token is not None else False
-                )
-                logging.debug(
-                    f"Stop condition met: finish_reason={finish_reason}, "
-                    f"last_token={last_token}, is_eos={is_eos}, "
-                    f"trim_length={stop_condition.trim_length}, "
-                    f"tokens_generated={len(tokens)}"
-                )
-                tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                text = text[: len(text) - stop_condition.trim_text_length]
-                segment = ""
-                break
-
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in ctx.stop_token_sequences
-                    )
+                if (
+                    self.stream
+                    and gen.state != "tool"
+                    and (text or tool_calls or reasoning_text)
                 ):
-                    continue
-                elif segment or reasoning_text or tool_calls:
-                    response = self.generate_response(
-                        segment,
+                    resp = self.generate_response(
+                        text,
                         None,
-                        tool_calls=parse_tools(tool_calls),
+                        tool_calls=tool_formatter(tool_calls),
                         reasoning_text=reasoning_text,
                     )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                     self.wfile.flush()
                     reasoning_text = ""
-                    segment = ""
+                    text = ""
                     tool_calls = []
 
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
+                if gen.finish_reason is not None:
+                    finish_reason = gen.finish_reason
 
-        # Flush any remaining tool text (e.g. when tool_call_end is empty)
-        if in_tool_call and tool_text:
-            tool_calls.append(tool_text)
+                prev_state = gen.state
 
-        # Log full response content for debugging tool call issues
-        parsed_tools = parse_tools(tool_calls)
-        logging.debug(
-            f"Response content: finish_reason={finish_reason}, "
-            f"tokens_generated={len(tokens)}, "
-            f"reasoning_text={repr(reasoning_text)[:500]}, "
-            f"text={repr(text)[:500]}, "
-            f"tool_calls={len(parsed_tools)}, "
-            f"parsed_tools={json.dumps(parsed_tools, ensure_ascii=False)[:1000]}"
-        )
+            if prev_state == "tool" and tool_text:
+                tool_calls.append(tool_text)
+                made_tool_call = True
 
-        # Log generation termination state for debugging
-        if in_tool_call or in_reasoning or (tool_text and not in_tool_call):
-            logging.warning(
-                f"Generation terminated with incomplete state: "
-                f"finish_reason={finish_reason}, "
-                f"in_tool_call={in_tool_call}, in_reasoning={in_reasoning}, "
-                f"tool_text_remaining={repr(tool_text)[:200]}, "
-                f"reasoning_remaining={repr(reasoning_text)[:200]}, "
-                f"tokens_generated={len(tokens)}"
-            )
+            if finish_reason == "stop" and made_tool_call:
+                finish_reason = "tool_calls"
 
-        if self.stream:
-            response = self.generate_response(
-                segment,
-                finish_reason,
-                tool_calls=parse_tools(tool_calls),
-                reasoning_text=reasoning_text,
-            )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-            self.wfile.flush()
-            if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(
+            if self.stream:
+                resp = self.generate_response(
+                    text,
+                    finish_reason,
+                    tool_calls=tool_formatter(tool_calls),
+                    reasoning_text=reasoning_text,
+                )
+                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                self.wfile.flush()
+                if (
+                    self.stream_options is not None
+                    and self.stream_options["include_usage"]
+                ):
+                    resp = self.completion_usage_response(
+                        len(ctx.prompt),
+                        len(tokens),
+                        ctx.prompt_cache_count,
+                    )
+                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write("data: [DONE]\n\n".encode())
+                self.wfile.flush()
+            else:
+                resp = self.generate_response(
+                    text,
+                    finish_reason,
                     len(ctx.prompt),
                     len(tokens),
                     ctx.prompt_cache_count,
+                    token_logprobs=token_logprobs,
+                    top_tokens=top_tokens,
+                    tokens=tokens,
+                    reasoning_text=reasoning_text,
+                    tool_calls=tool_formatter(tool_calls),
                 )
-                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                self.wfile.flush()
-            self.wfile.write("data: [DONE]\n\n".encode())
-            self.wfile.flush()
-        else:
-            response = self.generate_response(
-                text,
-                finish_reason,
-                len(ctx.prompt),
-                len(tokens),
-                ctx.prompt_cache_count,
-                token_logprobs=token_logprobs,
-                top_tokens=top_tokens,
-                tokens=tokens,
-                reasoning_text=reasoning_text,
-                tool_calls=parse_tools(tool_calls),
-            )
-            response_json = json.dumps(response).encode()
-            indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    response_debug = json.dumps(resp, indent="\t")
+                    logging.debug(f"Outgoing Response: {response_debug}")
 
-            # Send an additional Content-Length header when it is known
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json)
-            self.wfile.flush()
+                response_json = json.dumps(resp).encode()
+                self.send_header("Content-Length", str(len(response_json)))
+                self.end_headers()
+                self.wfile.write(response_json)
+                self.wfile.flush()
+        finally:
+            ctx.stop()
 
     def completion_usage_response(
         self,
@@ -1853,41 +1754,12 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    cache_dir = getattr(model_provider.cli_args, "prompt_cache_dir", None)
-    if cache_dir:
-        from .disk_cache import DiskBackedPromptCache
-
-        max_disk = getattr(model_provider.cli_args, "prompt_cache_disk_size", 100)
-        prompt_cache = DiskBackedPromptCache(
-            max_size=model_provider.cli_args.prompt_cache_size,
-            cache_dir=cache_dir,
-            max_disk_size=max_disk,
-        )
-    else:
-        prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
-        # Start HTTP server in a background thread.
-        # Generation MUST run on the main thread because MLX streams
-        # are thread-affine: async_eval requires the stream that was
-        # active when the model was loaded (stream 0, main thread).
-        http_thread = Thread(
-            target=_run_http_server,
-            args=(host, port, response_generator),
-            daemon=True,
-        )
-        http_thread.start()
-        try:
-            response_generator._generate()
-        except KeyboardInterrupt:
-            logging.info("Shutting down...")
-        finally:
-            response_generator._stop = True
+        _run_http_server(host, port, response_generator)
     else:
-        try:
-            response_generator._generate()
-        except KeyboardInterrupt:
-            pass
+        response_generator.join()
 
 
 def main():
@@ -2005,11 +1877,6 @@ def main():
         help="When a request is batchable then process that many prompts in parallel",
     )
     parser.add_argument(
-        "--no-batch",
-        action="store_true",
-        help="Disable batch processing, use single-serve mode for all requests",
-    )
-    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=2048,
@@ -2027,60 +1894,32 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
-        "--kv-cache-quantization",
-        type=str,
-        default=None,
-        metavar="K_BITS,V_BITS",
-        help="Quantize cached KV for memory savings, e.g. '8,4' for K@8-bit V@4-bit. "
-        "Converts caches before storing in the prompt cache LRU. "
-        "Saves ~20%% memory at 32K context with K8,V4.",
-    )
-    parser.add_argument(
-        "--quantized-kv-start",
-        type=int,
-        default=0,
-        help="Minimum number of tokens before quantizing a KV cache "
-        "(default: 0, quantize all). Short caches below this threshold "
-        "stay in fp16.",
-    )
-    parser.add_argument(
-        "--prompt-cache-dir",
-        type=str,
-        default=None,
-        help="Directory to persist prompt caches to disk. Survives server "
-        "restarts — cached prompts are restored from disk on cache miss. "
-        "Evicted caches are also saved here.",
-    )
-    parser.add_argument(
-        "--prompt-cache-disk-size",
-        type=int,
-        default=100,
-        help="Maximum number of disk cache entries (default: 100). "
-        "Independent of --prompt-cache-size which controls RAM entries.",
-    )
-    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        help="TurboQuant KV cache compression bits (1-4). "
+        "Uses PolarQuant with Hadamard rotation. 3-bit recommended.",
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        default=1,
+        help="Number of first/last layers to keep FP16 when using "
+        "--turbo-kv-bits (default: 1).",
+    )
+    parser.add_argument(
+        "--turbo-v-bits",
+        type=int,
+        default=None,
+        help="Use standard affine quantization for values at the given "
+        "bit width (e.g. 4) instead of PolarQuant. Requires --turbo-kv-bits.",
+    )
     args = parser.parse_args()
-
-    # Parse --kv-cache-quantization into a (k_bits, v_bits) tuple
-    if args.kv_cache_quantization is not None:
-        parts = args.kv_cache_quantization.split(",")
-        if len(parts) != 2:
-            parser.error("--kv-cache-quantization must be K_BITS,V_BITS (e.g. '8,4')")
-        try:
-            k_bits, v_bits = int(parts[0]), int(parts[1])
-        except ValueError:
-            parser.error("--kv-cache-quantization values must be integers")
-        valid_bits = {2, 4, 8}
-        if k_bits not in valid_bits or v_bits not in valid_bits:
-            parser.error(f"--kv-cache-quantization bits must be one of {valid_bits}")
-        args.kv_quant_config = (k_bits, v_bits)
-    else:
-        args.kv_quant_config = None
-
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
