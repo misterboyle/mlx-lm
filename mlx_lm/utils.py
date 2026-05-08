@@ -345,6 +345,11 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    # If sanitize remapped quantization config keys, apply them
+    if hasattr(model, "_quantization_config_remap"):
+        if "quantization" in config:
+            config["quantization"].update(model._quantization_config_remap)
+
     def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
