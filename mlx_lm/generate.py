@@ -241,6 +241,15 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--max-resident-experts",
+        type=int,
+        default=None,
+        help="Enable MoE expert offloading: keep at most N experts per "
+        "layer in RAM and stream cold ones from disk. Useful for models "
+        "with many experts (e.g. DeepSeek V4 with 256 experts). "
+        "Set to 0 to disable. A good starting value is 32.",
+    )
     return parser
 
 
@@ -2051,6 +2060,20 @@ def main():
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
     )
+
+    # Enable MoE expert offloading if requested
+    if args.max_resident_experts is not None and args.max_resident_experts > 0:
+        from .models.expert_offload import enable_expert_offloading
+
+        n_layers = enable_expert_offloading(
+            model, model_path, max_resident_experts=args.max_resident_experts,
+        )
+        if n_layers > 0:
+            print(
+                f"[INFO] Expert offloading enabled on {n_layers} layers, "
+                f"max {args.max_resident_experts} experts resident per layer"
+            )
+
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
 
