@@ -1368,8 +1368,23 @@ class DeepseekV4Attention(nn.Module):
         heads_per_group = self.n_heads // self.n_groups
         output = output.reshape(B, L, self.n_groups, heads_per_group * self.head_dim)
         if not isinstance(self.wo_a, list):
-            # Single wo_a linear (Thump604 format)
-            output = self.wo_a(output.reshape(B, L, -1))
+            # Single wo_a linear (Thump604 format): per-group matmul with row slicing
+            if hasattr(self.wo_a, 'bits'):
+                pieces = []
+                for g in range(self.n_groups):
+                    rows = slice(g * self.o_lora_rank, (g + 1) * self.o_lora_rank)
+                    biases = self.wo_a.biases[rows] if self.wo_a.biases is not None else None
+                    pieces.append(mx.quantized_matmul(
+                        output[:, :, g, :], self.wo_a.weight[rows], self.wo_a.scales[rows],
+                        biases, transpose=True, group_size=self.wo_a.group_size, bits=self.wo_a.bits,
+                    ))
+                output = mx.concatenate(pieces, axis=-1)
+            else:
+                pieces = []
+                for g in range(self.n_groups):
+                    rows = slice(g * self.o_lora_rank, (g + 1) * self.o_lora_rank)
+                    pieces.append(output[:, :, g, :] @ self.wo_a.weight[rows].T)
+                output = mx.concatenate(pieces, axis=-1)
         elif B == 1 and L == 1 and hasattr(self.wo_a[0], 'bits') and self.wo_a[0].bits == 4:
             from .fused_moe_kernel import fused_grouped_wo
             x_flat = output.reshape(self.n_groups, -1)
@@ -1859,9 +1874,11 @@ class Model(nn.Module):
         )
         if has_single_wo_a:
             for layer in self.model.layers:
+                group_feat = layer.attn.n_heads * layer.attn.head_dim // layer.attn.n_groups
                 layer.attn.wo_a = nn.Linear(
-                    layer.attn.n_heads * layer.attn.head_dim,
-                    layer.attn.o_lora_rank, bias=False,
+                    group_feat,
+                    layer.attn.n_groups * layer.attn.o_lora_rank,
+                    bias=False,
                 )
 
         return new_weights
