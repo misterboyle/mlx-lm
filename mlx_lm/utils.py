@@ -345,10 +345,23 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    # If sanitize remapped quantization config keys, apply them
-    if hasattr(model, "_quantization_config_remap"):
-        if "quantization" in config:
-            config["quantization"].update(model._quantization_config_remap)
+    # Remap quantization config keys to match sanitized weight paths.
+    # Models like DeepSeek V4 remap weight names in sanitize() (e.g.
+    # switch_mlp -> experts), so per-layer quantization config must match.
+    if "quantization" in config:
+        q = config["quantization"]
+        remap = {}
+        for qk in list(q.keys()):
+            if not isinstance(q[qk], dict):
+                continue
+            nk = qk
+            nk = nk.replace(".switch_mlp.", ".experts.")
+            nk = nk.replace(".shared_experts.gate_proj", ".shared_experts.w1")
+            nk = nk.replace(".shared_experts.up_proj", ".shared_experts.w3")
+            nk = nk.replace(".shared_experts.down_proj", ".shared_experts.w2")
+            if nk != qk:
+                remap[nk] = q[qk]
+        q.update(remap)
 
     def _quantize(quantization):
         def class_predicate(p, m):
