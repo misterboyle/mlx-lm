@@ -18,7 +18,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask
-from .cache import KVCache, RotatingKVCache, _BaseCache
+from .cache import KVCache, RotatingKVCache, _BaseCache, dynamic_roll
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -187,6 +187,367 @@ class SparseKVCache(_BaseCache):
 
     def is_trimmable(self):
         return True
+
+    def size(self):
+        return self.offset
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchSparseKVCache.merge(caches)
+
+
+class BatchSparseKVCache(_BaseCache):
+    """Batched version of SparseKVCache for concurrent request handling.
+
+    Wraps multiple SparseKVCache entries into a single batched cache.
+    Tracks per-entry offsets and batched sparse state (window buffers,
+    compressed buffers, compressor/indexer state).
+
+    During decode, the attention module processes sparse layers per-entry
+    because the compressor state machine has entry-dependent modular
+    arithmetic (offset % ratio). Dense layers (ratio=0) use
+    BatchRotatingKVCache and are fully batched.
+    """
+
+    step = 256
+
+    _SPARSE_ATTRS = SparseKVCache._SPARSE_ATTRS
+
+    def __init__(self, left_padding):
+        self.keys = None
+        self.values = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-l for l in left_padding])
+        self._idx = 0
+        self._right_padding = None
+        for attr in self._SPARSE_ATTRS:
+            setattr(self, attr, None)
+        # Track per-entry sparse buffer counts for variable-length comp_buf
+        self._comp_ns = None  # mx.array of per-entry comp counts
+
+    def update_and_fetch(self, keys, values):
+        prev = self._idx
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset += keys.shape[2]
+        self._idx += keys.shape[2]
+        self.keys[..., prev : self._idx, :] = keys
+        self.values[..., prev : self._idx, :] = values
+        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+    def empty(self):
+        return self.keys is None and self.win_buf is None
+
+    def size(self):
+        return self._idx
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchSparseKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            padding = self._right_padding
+            if self.keys is not None:
+                self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
+                self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        from .base import create_causal_mask
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
+
+    @property
+    def state(self):
+        k, v = self.keys, self.values
+        if k is not None and self._idx < k.shape[2]:
+            k = k[..., : self._idx, :]
+            v = v[..., : self._idx, :]
+        parts = [k, v, self.offset, self.left_padding]
+        for attr in self._SPARSE_ATTRS:
+            parts.append(getattr(self, attr, None))
+        return tuple(parts)
+
+    @state.setter
+    def state(self, v):
+        if v is None or v[0] is None:
+            return
+        self.keys, self.values, self.offset, self.left_padding = v[:4]
+        self._idx = self.keys.shape[2] if self.keys is not None else 0
+        for i, attr in enumerate(self._SPARSE_ATTRS):
+            idx = i + 4
+            if idx < len(v):
+                setattr(self, attr, v[idx])
+
+    @property
+    def meta_state(self):
+        return {"_idx": str(self._idx)}
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self._idx = int(v.get("_idx", 0))
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        obj._right_padding = None
+        obj._comp_ns = None
+        for attr in cls._SPARSE_ATTRS:
+            setattr(obj, attr, None)
+        obj.state = state
+        obj.meta_state = meta_state
+        return obj
+
+    @property
+    def nbytes(self):
+        total = 0
+        if self.keys is not None:
+            total += self.keys.nbytes + self.values.nbytes
+        for attr in self._SPARSE_ATTRS:
+            val = getattr(self, attr, None)
+            if val is not None:
+                total += val.nbytes
+        return total
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        for attr in self._SPARSE_ATTRS:
+            setattr(self, attr, None)
+        self._comp_ns = None
+        return n
+
+    def filter(self, batch_indices):
+        """In-place filter to keep just the given indices in the cache."""
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        for attr in self._SPARSE_ATTRS:
+            val = getattr(self, attr, None)
+            if val is not None:
+                setattr(self, attr, val[batch_indices])
+        if self._comp_ns is not None:
+            self._comp_ns = self._comp_ns[batch_indices]
+
+        # Reduce padding
+        min_left_pad = self.left_padding.min().item()
+        if min_left_pad > 0:
+            if self.keys is not None:
+                self.keys = self.keys[..., min_left_pad:, :]
+                self.values = self.values[..., min_left_pad:, :]
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def extend(self, other):
+        """In-place extend this cache with another BatchSparseKVCache."""
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            self._extend_sparse_attrs(other)
+            return
+
+        max_idx = max(self._idx, other._idx)
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys.shape
+            M = self.values.shape[3]
+        if other.keys is not None:
+            B, H, L2, D = other.keys.shape
+            M = other.values.shape[3]
+        max_size = max(L1, L2)
+
+        def pad_kv(c):
+            k, v = c.keys, c.values
+            if k is None:
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+                v = mx.array([]).reshape(Bc, H, 0, M)
+            left = max_idx - c._idx
+            right = max_size - k.shape[2] - left
+            if right < 0:
+                k = k[..., :right, :]
+                v = v[..., :right, :]
+                right = 0
+            if left != 0 or right != 0:
+                p = [(0, 0), (0, 0), (left, right), (0, 0)]
+                k = mx.pad(k, p)
+                v = mx.pad(v, p)
+            left_padding = c.left_padding + left
+            return k, v, c.offset, left_padding
+
+        self.keys, self.values, self.offset, self.left_padding = map(
+            mx.concatenate, zip(*(pad_kv(self), pad_kv(other)))
+        )
+        self._idx = max_idx
+        self._extend_sparse_attrs(other)
+
+    def _extend_sparse_attrs(self, other):
+        """Concatenate sparse attrs along batch dim, padding as needed."""
+        self_B = self.offset.shape[0]
+        other_B = other.offset.shape[0]
+
+        for attr in self._SPARSE_ATTRS:
+            a = getattr(self, attr, None)
+            b = getattr(other, attr, None)
+            if a is None and b is None:
+                continue
+            if a is None:
+                shape_a = list(b.shape)
+                shape_a[0] = self_B - b.shape[0] if self_B > b.shape[0] else self_B
+                a = mx.zeros(shape_a, dtype=b.dtype)
+            if b is None:
+                shape_b = list(a.shape)
+                shape_b[0] = other_B
+                b = mx.zeros(shape_b, dtype=a.dtype)
+            # Pad along non-batch dims if shapes differ
+            if a.shape[1:] != b.shape[1:]:
+                max_shape = [max(sa, sb) for sa, sb in zip(a.shape[1:], b.shape[1:])]
+                if list(a.shape[1:]) != max_shape:
+                    pad_widths = [(0, 0)] + [(0, ms - s) for s, ms in zip(a.shape[1:], max_shape)]
+                    a = mx.pad(a, pad_widths)
+                if list(b.shape[1:]) != max_shape:
+                    pad_widths = [(0, 0)] + [(0, ms - s) for s, ms in zip(b.shape[1:], max_shape)]
+                    b = mx.pad(b, pad_widths)
+            setattr(self, attr, mx.concatenate([a, b], axis=0))
+
+        # Extend comp_ns
+        a_ns = self._comp_ns
+        b_ns = getattr(other, '_comp_ns', None)
+        if a_ns is not None or b_ns is not None:
+            if a_ns is None:
+                a_ns = mx.zeros((self_B,), dtype=mx.int32)
+            if b_ns is None:
+                b_ns = mx.zeros((other_B,), dtype=mx.int32)
+            self._comp_ns = mx.concatenate([a_ns, b_ns])
+
+    def extract(self, idx):
+        """Extract a single cache entry back to a SparseKVCache."""
+        mx.eval(self.left_padding, self.offset)
+        cache = SparseKVCache()
+        padding = max(0, self.left_padding.tolist()[idx])
+        offset_val = self.offset.tolist()[idx]
+
+        if self.keys is not None:
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+            cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = offset_val
+
+        for attr in self._SPARSE_ATTRS:
+            val = getattr(self, attr, None)
+            if val is not None:
+                setattr(cache, attr, mx.contiguous(val[idx : idx + 1]))
+            else:
+                setattr(cache, attr, None)
+
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        """Merge multiple SparseKVCache instances into a BatchSparseKVCache."""
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths)
+
+        if max_length == 0:
+            return cls([0] * len(caches))
+
+        padding = [max_length - l for l in lengths]
+        B = len(caches)
+
+        # Merge keys/values (these are dummy offset trackers in sparse layers)
+        has_keys = any(c.keys is not None for c in caches)
+        if has_keys:
+            H = max(c.keys.shape[1] for c in caches if c.keys is not None)
+            Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
+            Dv = max(c.values.shape[3] for c in caches if c.values is not None)
+            dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+
+            keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
+            values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+            for i, (p, c) in enumerate(zip(padding, caches)):
+                if c.keys is None:
+                    continue
+                keys[i : i + 1, :, p : p + c.offset] = c.keys[..., : c.offset, :]
+                values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]
+        else:
+            keys = None
+            values = None
+
+        batch_cache = cls(padding)
+        batch_cache.keys = keys
+        batch_cache.values = values
+        if keys is not None:
+            batch_cache.offset += keys.shape[2]
+            batch_cache._idx = keys.shape[2]
+
+        # Merge sparse attrs: pad + concatenate along batch dim
+        for attr in SparseKVCache._SPARSE_ATTRS:
+            vals = [getattr(c, attr, None) for c in caches]
+            if all(v is None for v in vals):
+                setattr(batch_cache, attr, None)
+                continue
+            # Find max shape along non-batch dims
+            shapes = [v.shape for v in vals if v is not None]
+            ndim = len(shapes[0])
+            max_shape = list(shapes[0])
+            for s in shapes[1:]:
+                for d in range(1, ndim):
+                    max_shape[d] = max(max_shape[d], s[d])
+            dt = next(v.dtype for v in vals if v is not None)
+            # Pad None entries and mismatched shapes
+            padded = []
+            for v in vals:
+                if v is None:
+                    padded.append(mx.zeros([1] + max_shape[1:], dtype=dt))
+                elif list(v.shape[1:]) != max_shape[1:]:
+                    pw = [(0, 0)] + [(0, ms - s) for s, ms in zip(v.shape[1:], max_shape[1:])]
+                    padded.append(mx.pad(v, pw))
+                else:
+                    padded.append(v)
+            setattr(batch_cache, attr, mx.concatenate(padded, axis=0))
+
+        # Track per-entry compressed buffer counts
+        comp_ns = []
+        for c in caches:
+            cb = getattr(c, 'comp_buf', None)
+            comp_ns.append(cb.shape[1] if cb is not None else 0)
+        batch_cache._comp_ns = mx.array(comp_ns, dtype=mx.int32)
+
+        return batch_cache
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +1100,142 @@ class DeepseekV4Attention(nn.Module):
         return mx.take_along_axis(
             self._comp_buf[:, :comp_n], topk_exp, axis=1)
 
+    def _batched_sparse_decode(self, q, kv, x, cache, qr):
+        """Sparse decode for BatchSparseKVCache: per-entry processing.
+
+        The compressor state machine uses offset-dependent modular arithmetic
+        (offset % ratio for APE indexing, (offset+1) % ratio == 0 for compression
+        triggers), so different batch entries at different offsets cannot be
+        trivially vectorized. Instead we process each entry independently and
+        stack results.
+        """
+        B = x.shape[0]
+        mx.eval(cache.offset)
+        offsets = cache.offset.tolist()
+
+        outputs = []
+        for i in range(B):
+            # Temporarily load per-entry sparse state into module
+            self._win_buf = cache.win_buf[i:i+1] if cache.win_buf is not None else None
+            cb = cache.comp_buf
+            if cb is not None:
+                cn = cache._comp_ns[i].item() if cache._comp_ns is not None else cb.shape[1]
+                self._comp_buf = cb[i:i+1, :cn]
+                self._comp_n = cn
+            else:
+                self._comp_buf = None
+                self._comp_n = 0
+
+            if hasattr(self, 'compressor'):
+                if cache.comp_kv_state is not None:
+                    self.compressor._kv_state = cache.comp_kv_state[i:i+1]
+                    self.compressor._score_state = cache.comp_score_state[i:i+1]
+                else:
+                    self.compressor.reset_state(1)
+
+            if hasattr(self, 'indexer'):
+                if cache.idx_kv is not None:
+                    idx_n = cache.idx_kv.shape[1]
+                    self.indexer._index_kv = cache.idx_kv[i:i+1]
+                    self.indexer._idx_n = idx_n
+                else:
+                    self.indexer._index_kv = None
+                    self.indexer._idx_n = 0
+                if cache.idx_comp_kv_state is not None:
+                    self.indexer.compressor._kv_state = cache.idx_comp_kv_state[i:i+1]
+                    self.indexer.compressor._score_state = cache.idx_comp_score_state[i:i+1]
+                else:
+                    self.indexer.compressor.reset_state(1)
+
+            # Run sparse decode for this entry
+            out_i = self._sparse_decode(
+                q[i:i+1], kv[i:i+1], x[i:i+1], 1, offsets[i],
+                qr[i:i+1] if qr is not None else None,
+            )
+            outputs.append(out_i)
+
+            # Save per-entry sparse state back to cache (in-place slicing)
+            if cache.win_buf is not None:
+                cache.win_buf[i:i+1] = self._win_buf
+            elif self._win_buf is not None:
+                # First entry initializes the buffer; allocate for full batch
+                win = self.window_size
+                D = self.head_dim
+                cache.win_buf = mx.zeros(
+                    (B, win, D), dtype=self._win_buf.dtype)
+                cache.win_buf[i:i+1] = self._win_buf
+
+            # Sync comp_buf back: collect per-entry buffers for later merge
+            cn = getattr(self, '_comp_n', 0)
+            if not hasattr(self, '_batch_comp_bufs'):
+                self._batch_comp_bufs = [None] * B
+                self._batch_comp_ns = [0] * B
+            self._batch_comp_bufs[i] = self._comp_buf[:, :cn] if self._comp_buf is not None and cn > 0 else None
+            self._batch_comp_ns[i] = cn
+
+            # Sync compressor state back
+            if hasattr(self, 'compressor'):
+                if cache.comp_kv_state is None and self.compressor._kv_state is not None:
+                    sh = list(self.compressor._kv_state.shape)
+                    sh[0] = B
+                    cache.comp_kv_state = mx.zeros(sh, dtype=self.compressor._kv_state.dtype)
+                    cache.comp_score_state = mx.full(sh, float("-inf"))
+                if cache.comp_kv_state is not None:
+                    cache.comp_kv_state[i:i+1] = self.compressor._kv_state
+                    cache.comp_score_state[i:i+1] = self.compressor._score_state
+
+            # Sync indexer state back
+            if hasattr(self, 'indexer'):
+                if cache.idx_kv is None and self.indexer._index_kv is not None:
+                    sh = list(self.indexer._index_kv.shape)
+                    sh[0] = B
+                    cache.idx_kv = mx.zeros(sh, dtype=self.indexer._index_kv.dtype)
+                if cache.idx_kv is not None and self.indexer._index_kv is not None:
+                    idx_n = self.indexer._idx_n
+                    # May need to grow batch cache idx_kv
+                    if idx_n > cache.idx_kv.shape[1]:
+                        ext = mx.zeros(
+                            (B, idx_n - cache.idx_kv.shape[1], cache.idx_kv.shape[2]),
+                            dtype=cache.idx_kv.dtype)
+                        cache.idx_kv = mx.concatenate([cache.idx_kv, ext], axis=1)
+                    cache.idx_kv[i:i+1, :idx_n] = self.indexer._index_kv[:, :idx_n]
+                if cache.idx_comp_kv_state is None and hasattr(self.indexer, 'compressor') and self.indexer.compressor._kv_state is not None:
+                    sh = list(self.indexer.compressor._kv_state.shape)
+                    sh[0] = B
+                    cache.idx_comp_kv_state = mx.zeros(sh, dtype=self.indexer.compressor._kv_state.dtype)
+                    cache.idx_comp_score_state = mx.full(sh, float("-inf"))
+                if cache.idx_comp_kv_state is not None:
+                    cache.idx_comp_kv_state[i:i+1] = self.indexer.compressor._kv_state
+                    cache.idx_comp_score_state[i:i+1] = self.indexer.compressor._score_state
+
+        # Merge comp_buf back to cache
+        bufs = getattr(self, '_batch_comp_bufs', [None] * B)
+        ns = getattr(self, '_batch_comp_ns', [0] * B)
+        max_cn = max(ns) if ns else 0
+        if max_cn > 0:
+            D = next(b.shape[2] for b in bufs if b is not None)
+            dt = next(b.dtype for b in bufs if b is not None)
+            merged_comp = mx.zeros((B, max_cn, D), dtype=dt)
+            for i in range(B):
+                if bufs[i] is not None and ns[i] > 0:
+                    merged_comp[i:i+1, :ns[i]] = bufs[i]
+            cache.comp_buf = merged_comp
+            cache._comp_ns = mx.array(ns, dtype=mx.int32)
+        else:
+            cache.comp_buf = None
+            cache._comp_ns = mx.zeros((B,), dtype=mx.int32)
+
+        # Clean up temp state
+        if hasattr(self, '_batch_comp_bufs'):
+            del self._batch_comp_bufs
+            del self._batch_comp_ns
+
+        # Update cache offset tracker
+        cache.update_and_fetch(
+            mx.zeros((B, 1, 1, 1)), mx.zeros((B, 1, 1, 1)))
+
+        return mx.concatenate(outputs, axis=0)
+
     def __call__(
         self,
         x: mx.array,
@@ -748,9 +1245,10 @@ class DeepseekV4Attention(nn.Module):
         B, L, _ = x.shape
         rd = self.rope_head_dim
         ratio = self.compress_ratio
+        is_batch_sparse = isinstance(cache, BatchSparseKVCache)
 
         # Reset stale sparse state when a new conversation starts
-        if cache is not None and cache.offset == 0:
+        if cache is not None and not is_batch_sparse and cache.offset == 0:
             self._win_buf = None
             self._comp_buf = None
             self._comp_n = 0
@@ -832,7 +1330,15 @@ class DeepseekV4Attention(nn.Module):
                 output = weights @ kv_all[:, None, :, :]
             else:
                 output = self._dense_attn(q, kv_all, mask, L)
+        elif is_batch_sparse and L == 1:
+            # Batched sparse decode: process per-entry
+            output = self._batched_sparse_decode(q, kv, x, cache, qr)
         elif L > 1:
+            if is_batch_sparse:
+                # For batch sparse prefill, extract scalar offset from first
+                # entry (all entries in a prompt batch start at same position)
+                mx.eval(cache.offset)
+                offset = cache.offset[0].item()
             if offset == 0:
                 # First prefill chunk (new conversation)
                 output = self._sparse_prefill(q, kv, x, B, L)
@@ -872,22 +1378,27 @@ class DeepseekV4Attention(nn.Module):
                 group_outputs.append(self.wo_a[g](output[:, :, g, :]))
             output = mx.concatenate(group_outputs, axis=-1)
 
-        # Sync all sparse state to cache for serialization
-        if ratio > 0 and cache is not None and isinstance(cache, SparseKVCache):
-            cache.win_buf = getattr(self, '_win_buf', None)
-            # Save only valid portion of pre-allocated buffers
-            comp_n = getattr(self, '_comp_n', 0)
-            buf = getattr(self, '_comp_buf', None)
-            cache.comp_buf = buf[:, :comp_n] if buf is not None and comp_n > 0 else None
-            if hasattr(self, 'compressor'):
-                cache.comp_kv_state = self.compressor._kv_state
-                cache.comp_score_state = self.compressor._score_state
-            if hasattr(self, 'indexer'):
-                idx_n = getattr(self.indexer, '_idx_n', 0)
-                idx_buf = self.indexer._index_kv
-                cache.idx_kv = idx_buf[:, :idx_n] if idx_buf is not None and idx_n > 0 else None
-                cache.idx_comp_kv_state = self.indexer.compressor._kv_state
-                cache.idx_comp_score_state = self.indexer.compressor._score_state
+        # Sync all sparse state to cache for serialization.
+        # For BatchSparseKVCache during decode (L==1), state is synced
+        # in _batched_sparse_decode. For prefill (L>1), sync here.
+        if ratio > 0 and cache is not None and isinstance(cache, (SparseKVCache, BatchSparseKVCache)):
+            if not (is_batch_sparse and L == 1):
+                cache.win_buf = getattr(self, '_win_buf', None)
+                comp_n = getattr(self, '_comp_n', 0)
+                buf = getattr(self, '_comp_buf', None)
+                cache.comp_buf = buf[:, :comp_n] if buf is not None and comp_n > 0 else None
+                if is_batch_sparse and cache.comp_buf is not None:
+                    cache._comp_ns = mx.array(
+                        [comp_n] * cache.comp_buf.shape[0], dtype=mx.int32)
+                if hasattr(self, 'compressor'):
+                    cache.comp_kv_state = self.compressor._kv_state
+                    cache.comp_score_state = self.compressor._score_state
+                if hasattr(self, 'indexer'):
+                    idx_n = getattr(self.indexer, '_idx_n', 0)
+                    idx_buf = self.indexer._index_kv
+                    cache.idx_kv = idx_buf[:, :idx_n] if idx_buf is not None and idx_n > 0 else None
+                    cache.idx_comp_kv_state = self.indexer.compressor._kv_state
+                    cache.idx_comp_score_state = self.indexer.compressor._score_state
 
         return self.wo_b(output)
 
@@ -1164,13 +1675,37 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        mpt_layer = self.args.num_hidden_layers
+        n_layers = self.args.num_hidden_layers
+
+        # Detect original HF checkpoint format:
+        #   - has `.scale` tensors (FP8 block scaling)
+        #   - has `mtp.` prefix (multi-token prediction weights)
+        #   - has `gate.bias` instead of `gate.e_score_correction_bias`
+        is_hf_original = any(
+            k.endswith(".scale") or k.startswith("mtp.")
+            for k in weights
+        )
+
+        # --- Step 0: Drop MTP weights and layers beyond num_hidden_layers ---
+        def _is_excess_layer(key):
+            """Check if key belongs to a layer index >= n_layers.
+            Handles both 'layers.N.x' (HF original) and 'model.layers.N.x'."""
+            parts = key.split(".")
+            for i, p in enumerate(parts):
+                if p == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                    return int(parts[i + 1]) >= n_layers
+            return False
+
         weights = {
             k: v for k, v in weights.items()
-            if not (len(k.split(".")) >= 3 and k.split(".")[1] == "layers"
-                    and k.split(".")[2].isdigit() and int(k.split(".")[2]) >= mpt_layer)
+            if not k.startswith("mtp.") and not _is_excess_layer(k)
         }
 
+        # --- Step 1: FP8/FP4 block dequantization (original HF only) ---
+        if is_hf_original:
+            weights = self._dequant_scaled_weights(weights)
+
+        # --- Step 2: Top-level key remapping ---
         renames = {}
         for k in list(weights.keys()):
             new_k = k
@@ -1189,18 +1724,114 @@ class Model(nn.Module):
         for old, new in renames.items():
             weights[new] = weights.pop(old)
 
-        expert_renames = {}
-        for k in list(weights.keys()):
-            if ".ffn.experts.w1." in k:
-                expert_renames[k] = k.replace(".ffn.experts.w1.", ".ffn.experts.gate_proj.")
-            elif ".ffn.experts.w2." in k:
-                expert_renames[k] = k.replace(".ffn.experts.w2.", ".ffn.experts.down_proj.")
-            elif ".ffn.experts.w3." in k:
-                expert_renames[k] = k.replace(".ffn.experts.w3.", ".ffn.experts.up_proj.")
-        for old, new in expert_renames.items():
-            weights[new] = weights.pop(old)
+        # --- Step 3: Routed expert w1/w2/w3 rename (pre-stacked mlx-community) ---
+        new_weights = {}
+        for k, v in weights.items():
+            nk = k
+            if ".ffn.experts.w1." in nk:
+                nk = nk.replace(".ffn.experts.w1.", ".ffn.experts.gate_proj.")
+            elif ".ffn.experts.w2." in nk:
+                nk = nk.replace(".ffn.experts.w2.", ".ffn.experts.down_proj.")
+            elif ".ffn.experts.w3." in nk:
+                nk = nk.replace(".ffn.experts.w3.", ".ffn.experts.up_proj.")
+            new_weights[nk] = v
+        weights = new_weights
+
+        # --- Step 4: Stack per-expert weights for SwitchGLU (HF original) ---
+        # HF original has per-expert: model.layers.N.ffn.experts.E.w{1,2,3}.weight
+        # We need stacked: model.layers.N.ffn.experts.{gate,down,up}_proj.weight
+        _expert_w_map = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+        for l in range(n_layers):
+            prefix = f"model.layers.{l}.ffn.experts"
+            for src, dst in _expert_w_map.items():
+                key0 = f"{prefix}.0.{src}.weight"
+                if key0 in weights:
+                    stack = []
+                    for e in range(self.args.n_routed_experts):
+                        ek = f"{prefix}.{e}.{src}.weight"
+                        stack.append(weights.pop(ek))
+                    weights[f"{prefix}.{dst}.weight"] = mx.stack(stack)
 
         return weights
+
+    @staticmethod
+    def _dequant_scaled_weights(weights):
+        """Dequantize FP8 e4m3 block-scaled and FP4 packed weights.
+
+        Original HF checkpoint stores:
+          - Most weight matrices as FP8 e4m3 (uint8) with ue8m0 128x128 block scales
+          - Routed expert weights as FP4 packed (int8, 2 values per byte) with 32-element block scales
+          - Scale tensors have `.scale` suffix matching the `.weight` tensor
+
+        After dequant, `.scale` keys are consumed and only `.weight` keys remain.
+        """
+
+        def _scale_to_float(scale):
+            """Convert ue8m0 scale (uint8 encoding of fp32 exponent) to float."""
+            if scale.dtype == mx.uint8:
+                return mx.exp((scale.astype(mx.float32) - 127.0) * math.log(2.0))
+            return scale.astype(mx.float32)
+
+        def _dequant_fp8_block(weight, scale, block_size=128):
+            """Dequantize FP8 e4m3 weight with ue8m0 128x128 block scaling."""
+            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
+            scale = _scale_to_float(scale)
+            m, n = weight.shape
+            # Pad to block_size boundary
+            pad_m = (-m) % block_size
+            pad_n = (-n) % block_size
+            if pad_m or pad_n:
+                weight = mx.pad(weight, ((0, pad_m), (0, pad_n)))
+            mb = (m + pad_m) // block_size
+            nb = (n + pad_n) // block_size
+            weight = weight.reshape(mb, block_size, nb, block_size)
+            weight = (weight * scale[:, None, :, None]).reshape(
+                m + pad_m, n + pad_n)
+            return weight[:m, :n].astype(mx.bfloat16)
+
+        def _dequant_fp4_block(weight, scale, block_size=32):
+            """Dequantize FP4 packed expert weights (2 nibbles per byte)."""
+            table = mx.array(
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                dtype=mx.float32,
+            )
+            packed = weight.astype(mx.uint8)
+            low = packed & 0x0F
+            high = (packed >> 4) & 0x0F
+            unpacked = mx.stack(
+                [mx.take(table, low), mx.take(table, high)], axis=-1)
+            unpacked = unpacked.reshape(weight.shape[0], weight.shape[1] * 2)
+            scale = mx.repeat(_scale_to_float(scale), block_size, axis=-1)
+            return (unpacked * scale).astype(mx.bfloat16)
+
+        new = {}
+        for k, v in weights.items():
+            if k.endswith(".scale"):
+                wk = k[:-len(".scale")] + ".weight"
+                w = weights.get(wk)
+                if w is None:
+                    # Orphan scale (no matching weight), keep it
+                    new[k] = v
+                    continue
+                # FP4 packed routed experts: int8/uint8 weight where
+                # scale covers 2x more columns (each byte = 2 values)
+                if (w.dtype in (mx.int8, mx.uint8)
+                        and ".ffn.experts." in wk
+                        and "shared_experts" not in wk
+                        and v.shape[-1] * 16 == w.shape[-1]):
+                    new[wk] = _dequant_fp4_block(w, v)
+                # FP8 e4m3: uint8 weight with block scale
+                elif w.dtype == mx.uint8:
+                    new[wk] = _dequant_fp8_block(w, v)
+                else:
+                    # Non-FP8 scale (keep both)
+                    new[k] = v
+                    if wk not in new:
+                        new[wk] = w
+            elif k not in new:
+                new[k] = v
+        return new
 
     @property
     def layers(self):

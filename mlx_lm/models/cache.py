@@ -17,6 +17,7 @@ def make_prompt_cache(
     max_kv_size: Optional[int] = None,
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
+    turbo_v_bits: Optional[int] = None,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -34,6 +35,10 @@ def make_prompt_cache(
             compression. Default: ``None`` (no compression).
         turbo_fp16_layers (int): Number of first/last layers to keep in FP16
             when using TurboQuant. Default: ``1``.
+        turbo_v_bits (Optional[int]): If provided, use standard affine
+            quantization at the given bit width for values instead of
+            PolarQuant. Values tolerate simple quantization well.
+            Default: ``None`` (use PolarQuant for values too).
     """
     if turbo_kv_bits is not None:
         # Check for MLA (Multi-Latent Attention) models.
@@ -79,7 +84,7 @@ def make_prompt_cache(
             if i < turbo_fp16_layers or i >= num_layers - turbo_fp16_layers:
                 caches.append(KVCache())
             else:
-                caches.append(TurboQuantKVCache(bits=turbo_kv_bits))
+                caches.append(TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits))
         return caches
 
     if max_kv_size is not None:
@@ -151,11 +156,19 @@ def load_prompt_cache(file_name, return_metadata=False):
         except ImportError:
             pass
 
+    if "BatchSparseKVCache" not in globals():
+        try:
+            from mlx_lm.models.deepseek_v4 import BatchSparseKVCache
+            globals()["BatchSparseKVCache"] = BatchSparseKVCache
+        except ImportError:
+            pass
+
     _ALLOWED_CACHE_CLASSES = {
         "KVCache", "QuantizedKVCache", "RotatingKVCache",
         "CacheList", "BatchKVCache", "BatchRotatingKVCache",
         "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
         "TurboQuantKVCache", "MixedQuantKVCache", "SparseKVCache",
+        "BatchSparseKVCache",
     }
     for c in classes:
         if c not in _ALLOWED_CACHE_CLASSES:
@@ -475,10 +488,10 @@ class KVCache(_BaseCache):
             )
         return quant_cache
 
-    def to_turbo_quantized(self, bits: int = 3):
+    def to_turbo_quantized(self, bits: int = 3, v_bits: int = None):
         from mlx_lm.models.turboquant_cache import TurboQuantKVCache
 
-        tq_cache = TurboQuantKVCache(bits=bits)
+        tq_cache = TurboQuantKVCache(bits=bits, v_bits=v_bits)
         if self.keys is not None:
             tq_cache.update_and_fetch(
                 self.keys[..., : self.offset, :],
@@ -994,6 +1007,7 @@ class CacheList(_BaseCache):
             "CacheList", "BatchKVCache", "BatchRotatingKVCache",
             "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
             "TurboQuantKVCache", "MixedQuantKVCache", "SparseKVCache",
+            "BatchSparseKVCache",
         }
         for c in meta_state[0]:
             if c not in _ALLOWED:

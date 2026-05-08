@@ -222,6 +222,14 @@ def setup_arg_parser():
         default=1,
     )
     parser.add_argument(
+        "--turbo-v-bits",
+        type=int,
+        help="Use standard affine quantization for values at the given "
+        "bit width (e.g. 4) instead of PolarQuant. Values tolerate "
+        "simple quantization well. Requires --turbo-kv-bits. Default: none.",
+        default=None,
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -337,6 +345,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
+    turbo_v_bits: Optional[int] = None,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -368,6 +377,9 @@ def generate_step(
           None implies no TurboQuant. Default: ``None``.
         turbo_fp16_layers (int): Number of first/last layers to keep in FP16 when
           using TurboQuant. Default: ``1``.
+        turbo_v_bits (int, optional): Use standard affine quantization at the
+          given bit width for values instead of PolarQuant. Values tolerate
+          simple quantization well. Default: ``None``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -399,6 +411,7 @@ def generate_step(
             max_kv_size=max_kv_size,
             turbo_kv_bits=turbo_kv_bits,
             turbo_fp16_layers=turbo_fp16_layers,
+            turbo_v_bits=turbo_v_bits,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -2110,6 +2123,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         turbo_kv_bits=args.turbo_kv_bits,
         turbo_fp16_layers=args.turbo_fp16_layers,
+        turbo_v_bits=args.turbo_v_bits,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )

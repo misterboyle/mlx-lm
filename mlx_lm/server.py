@@ -449,6 +449,9 @@ class ResponseGenerator:
         self._turbo_fp16_layers = getattr(
             model_provider.cli_args, "turbo_fp16_layers", 1
         )
+        self._turbo_v_bits = getattr(
+            model_provider.cli_args, "turbo_v_bits", None
+        )
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -978,6 +981,7 @@ class ResponseGenerator:
                     self.model_provider.model,
                     turbo_kv_bits=self._turbo_kv_bits,
                     turbo_fp16_layers=self._turbo_fp16_layers,
+                    turbo_v_bits=self._turbo_v_bits,
                 )
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
@@ -1907,6 +1911,13 @@ def main():
         default=1,
         help="Number of first/last layers to keep FP16 when using "
         "--turbo-kv-bits (default: 1).",
+    )
+    parser.add_argument(
+        "--turbo-v-bits",
+        type=int,
+        default=None,
+        help="Use standard affine quantization for values at the given "
+        "bit width (e.g. 4) instead of PolarQuant. Requires --turbo-kv-bits.",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
