@@ -1367,7 +1367,10 @@ class DeepseekV4Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3)
         heads_per_group = self.n_heads // self.n_groups
         output = output.reshape(B, L, self.n_groups, heads_per_group * self.head_dim)
-        if B == 1 and L == 1 and hasattr(self.wo_a[0], 'bits') and self.wo_a[0].bits == 4:
+        if not isinstance(self.wo_a, list):
+            # Single wo_a linear (Thump604 format)
+            output = self.wo_a(output.reshape(B, L, -1))
+        elif B == 1 and L == 1 and hasattr(self.wo_a[0], 'bits') and self.wo_a[0].bits == 4:
             from .fused_moe_kernel import fused_grouped_wo
             x_flat = output.reshape(self.n_groups, -1)
             output = fused_grouped_wo(x_flat, self.wo_a).astype(output.dtype)
@@ -1843,58 +1846,23 @@ class Model(nn.Module):
             nk = nk.replace(".shared_experts.up_proj.", ".shared_experts.w3.")
             nk = nk.replace(".shared_experts.down_proj.", ".shared_experts.w2.")
 
-            # --- wo_a: detect single-layer format for later splitting ---
-            # Our model: attn.wo_a is a list of nn.Linear (n_groups entries)
-            # Thump604: attn.wo_a is a single QuantizedLinear
-            # Keys like "model.layers.N.attn.wo_a.weight" (no group index)
-            # need to become "model.layers.N.attn.wo_a.0.weight" etc.
-            if ".attn.wo_a." in nk:
-                parts = nk.split(".attn.wo_a.")
-                suffix = parts[1]  # e.g. "weight", "scales", "biases"
-                # Check if already indexed (e.g. "0.weight")
-                first_part = suffix.split(".")[0]
-                if not first_part.isdigit():
-                    # Single layer format -- collect for splitting
-                    # Extract layer index from prefix
-                    prefix = parts[0]
-                    # Find layer index: ...layers.N...
-                    layer_parts = prefix.split(".")
-                    layer_idx = None
-                    for i, p in enumerate(layer_parts):
-                        if p == "layers" and i + 1 < len(layer_parts):
-                            try:
-                                layer_idx = int(layer_parts[i + 1])
-                            except ValueError:
-                                pass
-                    if layer_idx is not None:
-                        if layer_idx not in wo_a_singles:
-                            wo_a_singles[layer_idx] = {}
-                        wo_a_singles[layer_idx][suffix] = v
-                        continue  # Don't add to new_weights yet
-
             new_weights[nk] = v
 
-        # --- Split single wo_a into grouped list ---
-        for layer_idx, tensors in wo_a_singles.items():
-            prefix = f"model.layers.{layer_idx}.attn.wo_a"
-            for suffix, tensor in tensors.items():
-                # Split along axis=1 (input dimension in quantized format)
-                # weight: (out_dim, in_dim_packed) -> split in_dim_packed
-                # scales: (out_dim, in_dim/group_size) -> split axis=1
-                # biases: same shape as scales -> split axis=1
-                if tensor.ndim == 2:
-                    chunk_size = tensor.shape[1] // n_groups
-                    for g in range(n_groups):
-                        start = g * chunk_size
-                        end = start + chunk_size
-                        new_weights[f"{prefix}.{g}.{suffix}"] = tensor[:, start:end]
-                elif tensor.ndim == 1:
-                    # Scalar/bias per output dim -- replicate to each group
-                    for g in range(n_groups):
-                        new_weights[f"{prefix}.{g}.{suffix}"] = tensor
-                else:
-                    # Unexpected shape, keep original
-                    new_weights[f"{prefix}.{suffix}"] = tensor
+        # --- wo_a: replace grouped list with single Linear if needed ---
+        # Thump604 stores wo_a as a single QuantizedLinear, our model inits
+        # it as a list. Replace self.wo_a with a single Linear so load_weights
+        # can assign the weights.
+        has_single_wo_a = any(
+            ".attn.wo_a.weight" in k and not any(
+                f".attn.wo_a.{g}." in k for g in range(n_groups)
+            ) for k in new_weights
+        )
+        if has_single_wo_a:
+            for layer in self.model.layers:
+                layer.attn.wo_a = nn.Linear(
+                    layer.attn.n_heads * layer.attn.head_dim,
+                    layer.attn.o_lora_rank, bias=False,
+                )
 
         return new_weights
 
