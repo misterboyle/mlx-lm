@@ -35,17 +35,37 @@ def make_prompt_cache(
         turbo_fp16_layers (int): Number of first/last layers to keep in FP16
             when using TurboQuant. Default: ``1``.
     """
+    if turbo_kv_bits is not None:
+        # Check for MLA (Multi-Latent Attention) models.
+        # Models with kv_lora_rank store compressed latents in the cache,
+        # not standard key/value tensors, so TurboQuant produces garbage.
+        layers = model.layers if hasattr(model, "layers") else []
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None) or getattr(
+                layer, "attn", None
+            )
+            if attn is not None and hasattr(attn, "kv_lora_rank"):
+                raise ValueError(
+                    "[TurboQuant] Incompatible with Multi-Latent Attention (MLA). "
+                    "Models with kv_lora_rank store compressed latents in the "
+                    "cache, not standard key/value tensors."
+                )
+            break
+
     if hasattr(model, "make_cache"):
         default_cache = model.make_cache()
         if turbo_kv_bits is not None:
-            # Check compatibility
-            if not isinstance(default_cache[0], KVCache):
-                raise ValueError(
-                    f"[TurboQuant] Incompatible cache type: "
-                    f"{type(default_cache[0]).__name__}. "
-                    f"TurboQuant only works with standard multi-head "
-                    f"attention (KVCache)."
-                )
+            # Check that all layers use a compatible cache type.
+            # Hybrid SSM/attention models (e.g. Qwen3.5) mix ArraysCache
+            # with KVCache; TurboQuant cannot handle non-KV cache layers.
+            for i, c in enumerate(default_cache):
+                if not isinstance(c, (KVCache, RotatingKVCache)):
+                    raise ValueError(
+                        f"[TurboQuant] Incompatible cache type in layer {i}: "
+                        f"{type(c).__name__}. "
+                        f"TurboQuant only works with standard multi-head "
+                        f"attention (KVCache/RotatingKVCache)."
+                    )
         else:
             return default_cache
 
@@ -124,11 +144,18 @@ def load_prompt_cache(file_name, return_metadata=False):
         except ImportError:
             pass
 
+    if "SparseKVCache" not in globals():
+        try:
+            from mlx_lm.models.deepseek_v4 import SparseKVCache
+            globals()["SparseKVCache"] = SparseKVCache
+        except ImportError:
+            pass
+
     _ALLOWED_CACHE_CLASSES = {
         "KVCache", "QuantizedKVCache", "RotatingKVCache",
         "CacheList", "BatchKVCache", "BatchRotatingKVCache",
         "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
-        "TurboQuantKVCache", "MixedQuantKVCache",
+        "TurboQuantKVCache", "MixedQuantKVCache", "SparseKVCache",
     }
     for c in classes:
         if c not in _ALLOWED_CACHE_CLASSES:
@@ -919,7 +946,7 @@ class CacheList(_BaseCache):
             "KVCache", "QuantizedKVCache", "RotatingKVCache",
             "CacheList", "BatchKVCache", "BatchRotatingKVCache",
             "ConcatenateKVCache", "ArraysCache", "ChunkedKVCache",
-            "TurboQuantKVCache", "MixedQuantKVCache",
+            "TurboQuantKVCache", "MixedQuantKVCache", "SparseKVCache",
         }
         for c in meta_state[0]:
             if c not in _ALLOWED:

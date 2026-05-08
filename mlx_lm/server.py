@@ -509,6 +509,12 @@ class ResponseGenerator:
         self._kv_quant_start = getattr(
             model_provider.cli_args, "quantized_kv_start", 0
         )
+        self._turbo_kv_bits = getattr(
+            model_provider.cli_args, "turbo_kv_bits", None
+        )
+        self._turbo_fp16_layers = getattr(
+            model_provider.cli_args, "turbo_fp16_layers", 1
+        )
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -738,7 +744,11 @@ class ResponseGenerator:
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
                     if cache is None or not cache:
-                        cache = make_prompt_cache(self.model_provider.model)
+                        cache = make_prompt_cache(
+                            self.model_provider.model,
+                            turbo_kv_bits=self._turbo_kv_bits,
+                            turbo_fp16_layers=self._turbo_fp16_layers,
+                        )
                     elif self._kv_quant_config is not None:
                         # Dequantize for batch merge compatibility
                         cache = _maybe_dequantize_cache(cache)
@@ -952,7 +962,11 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                cache = make_prompt_cache(
+                    self.model_provider.model,
+                    turbo_kv_bits=self._turbo_kv_bits,
+                    turbo_fp16_layers=self._turbo_fp16_layers,
+                )
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
             else:
@@ -2028,6 +2042,20 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        help="TurboQuant KV cache compression bits (1-4). "
+        "Uses PolarQuant with Hadamard rotation. 3-bit recommended.",
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        default=1,
+        help="Number of first/last layers to keep FP16 when using "
+        "--turbo-kv-bits (default: 1).",
     )
     args = parser.parse_args()
 

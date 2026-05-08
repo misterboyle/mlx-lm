@@ -749,6 +749,12 @@ class DeepseekV4Attention(nn.Module):
         rd = self.rope_head_dim
         ratio = self.compress_ratio
 
+        # Reset stale sparse state when a new conversation starts
+        if cache is not None and cache.offset == 0:
+            self._win_buf = None
+            self._comp_buf = None
+            self._comp_n = 0
+
         # Restore sparse state from cache (after cache load / multi-turn)
         if (ratio > 0 and cache is not None
                 and isinstance(cache, SparseKVCache)
@@ -771,6 +777,7 @@ class DeepseekV4Attention(nn.Module):
         # Fused Q+KV first projection (1 dispatch instead of 2)
         if B == 1 and L == 1 and hasattr(self.wq_a, 'bits'):
             if not hasattr(self, '_fused_qkv_w'):
+                assert self.wq_a.group_size == self.wkv.group_size and self.wq_a.bits == self.wkv.bits
                 self._fused_qkv_w = mx.concatenate([self.wq_a.weight, self.wkv.weight], axis=0)
                 self._fused_qkv_s = mx.concatenate([self.wq_a.scales, self.wkv.scales], axis=0)
                 self._fused_qkv_b = mx.concatenate([self.wq_a.biases, self.wkv.biases], axis=0)
@@ -979,12 +986,15 @@ class DeepseekV4MoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HyperConnectionBlock(nn.Module):
-    # Layers where MoE is skipped during decode (19% skip, quality-validated)
-    _SKIP_MOE_LAYERS = frozenset(range(3, 41, 5))  # {3,8,13,18,23,28,33,38}
-
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
+        # Layers where MoE is skipped during decode (19% skip, quality-validated).
+        # Only apply for the 43-layer config this was tuned for.
+        if args.num_hidden_layers == 43:
+            self._skip_moe_layers = frozenset(range(3, 41, 5))  # {3,8,13,18,23,28,33,38}
+        else:
+            self._skip_moe_layers = frozenset()
         self.hc_mult = args.hc_mult
         self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
@@ -1043,7 +1053,7 @@ class HyperConnectionBlock(nn.Module):
         x = self._hc_post(y, residual, post, comb)
 
         # Skip MoE on selected layers during decode (saves ~25% MoE compute)
-        if self.layer_id in self._SKIP_MOE_LAYERS and x.shape[1] == 1:
+        if self.layer_id in self._skip_moe_layers and x.shape[1] == 1:
             return x
 
         residual = x
