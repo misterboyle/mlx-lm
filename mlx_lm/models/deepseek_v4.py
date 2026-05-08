@@ -1686,6 +1686,18 @@ class Model(nn.Module):
             for k in weights
         )
 
+        # Detect Thump604 MLX conversion format:
+        #   - has `hc_attn.base` (dot-separated HC attrs vs our `hc_attn_base`)
+        #   - has `e_score_correction_bias` (vs our `gate.bias`)
+        #   - has `switch_mlp.` (vs our `ffn.experts.`)
+        #   - has `shared_experts.gate_proj` (vs our `shared_experts.w1`)
+        is_thump604 = any(
+            "hc_attn.base" in k or "hc_ffn.base" in k or "hc_head.base" in k
+            or ".e_score_correction_bias" in k
+            or ".switch_mlp." in k
+            for k in weights
+        )
+
         # --- Step 0: Drop MTP weights and layers beyond num_hidden_layers ---
         def _is_excess_layer(key):
             """Check if key belongs to a layer index >= n_layers.
@@ -1704,6 +1716,10 @@ class Model(nn.Module):
         # --- Step 1: FP8/FP4 block dequantization (original HF only) ---
         if is_hf_original:
             weights = self._dequant_scaled_weights(weights)
+
+        # --- Step 1b: Thump604 MLX conversion remapping ---
+        if is_thump604:
+            weights = self._remap_thump604(weights)
 
         # --- Step 2: Top-level key remapping ---
         renames = {}
@@ -1753,6 +1769,132 @@ class Model(nn.Module):
                     weights[f"{prefix}.{dst}.weight"] = mx.stack(stack)
 
         return weights
+
+    def _remap_thump604(self, weights):
+        """Remap weight keys from Thump604 MLX conversion naming to ours.
+
+        Thump604 (e.g. Thump604/DeepSeek-V4-Flash-MLX-Q2-mixed-gs128-affine)
+        uses a different model class with these naming differences:
+
+          Thump604                          Ours
+          --------                          ----
+          hc_attn.base / .fn / .scale       hc_attn_base / _fn / _scale
+          hc_ffn.base / .fn / .scale        hc_ffn_base / _fn / _scale
+          hc_head.base / .fn / .scale       hc_head_base / _fn / _scale
+          gate.e_score_correction_bias      gate.bias
+          shared_experts.gate_proj          shared_experts.w1
+          shared_experts.up_proj            shared_experts.w3
+          shared_experts.down_proj          shared_experts.w2
+          switch_mlp.gate_proj/up_proj/     ffn.experts.gate_proj/up_proj/
+            down_proj                         down_proj
+          mlp.switch_mlp.*                  ffn.experts.*
+          mlp.shared_experts.*              ffn.shared_experts.*
+          mlp.gate.*                        ffn.gate.*
+          self_attn.*                       attn.*
+          input_layernorm                   attn_norm
+          post_attention_layernorm          ffn_norm
+          attn.wo_a (single QuantizedLinear) attn.wo_a.{0..N} (grouped list)
+        """
+        n_groups = self.args.o_groups
+
+        new_weights = {}
+        # Collect wo_a keys that need splitting: {layer_idx: {suffix: tensor}}
+        wo_a_singles = {}
+
+        for k, v in weights.items():
+            nk = k
+
+            # --- Hyper-connection dot notation -> underscore ---
+            # hc_attn.base -> hc_attn_base (etc for fn, scale)
+            for hc_prefix in ("hc_attn", "hc_ffn", "hc_head"):
+                for hc_attr in ("base", "fn", "scale"):
+                    dot_form = f"{hc_prefix}.{hc_attr}"
+                    underscore_form = f"{hc_prefix}_{hc_attr}"
+                    if dot_form in nk:
+                        nk = nk.replace(dot_form, underscore_form)
+
+            # --- Layer norm renames ---
+            nk = nk.replace(".input_layernorm.", ".attn_norm.")
+            nk = nk.replace(".post_attention_layernorm.", ".ffn_norm.")
+
+            # --- self_attn -> attn ---
+            nk = nk.replace(".self_attn.", ".attn.")
+
+            # --- Gate bias rename ---
+            nk = nk.replace(
+                ".e_score_correction_bias", ".bias"
+            )
+
+            # --- MLP wrapper -> ffn ---
+            # mlp.switch_mlp.* -> ffn.experts.*
+            nk = nk.replace(".mlp.switch_mlp.", ".ffn.experts.")
+            # mlp.shared_experts.* -> ffn.shared_experts.*
+            nk = nk.replace(".mlp.shared_experts.", ".ffn.shared_experts.")
+            # mlp.gate.* -> ffn.gate.*
+            nk = nk.replace(".mlp.gate.", ".ffn.gate.")
+            # Bare switch_mlp (no mlp. wrapper) -> ffn.experts
+            if ".switch_mlp." in nk and ".ffn.experts." not in nk:
+                nk = nk.replace(".switch_mlp.", ".ffn.experts.")
+
+            # --- Shared experts: gate_proj/up_proj/down_proj -> w1/w3/w2 ---
+            nk = nk.replace(".shared_experts.gate_proj.", ".shared_experts.w1.")
+            nk = nk.replace(".shared_experts.up_proj.", ".shared_experts.w3.")
+            nk = nk.replace(".shared_experts.down_proj.", ".shared_experts.w2.")
+
+            # --- wo_a: detect single-layer format for later splitting ---
+            # Our model: attn.wo_a is a list of nn.Linear (n_groups entries)
+            # Thump604: attn.wo_a is a single QuantizedLinear
+            # Keys like "model.layers.N.attn.wo_a.weight" (no group index)
+            # need to become "model.layers.N.attn.wo_a.0.weight" etc.
+            if ".attn.wo_a." in nk:
+                parts = nk.split(".attn.wo_a.")
+                suffix = parts[1]  # e.g. "weight", "scales", "biases"
+                # Check if already indexed (e.g. "0.weight")
+                first_part = suffix.split(".")[0]
+                if not first_part.isdigit():
+                    # Single layer format -- collect for splitting
+                    # Extract layer index from prefix
+                    prefix = parts[0]
+                    # Find layer index: ...layers.N...
+                    layer_parts = prefix.split(".")
+                    layer_idx = None
+                    for i, p in enumerate(layer_parts):
+                        if p == "layers" and i + 1 < len(layer_parts):
+                            try:
+                                layer_idx = int(layer_parts[i + 1])
+                            except ValueError:
+                                pass
+                    if layer_idx is not None:
+                        if layer_idx not in wo_a_singles:
+                            wo_a_singles[layer_idx] = {}
+                        wo_a_singles[layer_idx][suffix] = v
+                        continue  # Don't add to new_weights yet
+
+            new_weights[nk] = v
+
+        # --- Split single wo_a into grouped list ---
+        for layer_idx, tensors in wo_a_singles.items():
+            prefix = f"model.layers.{layer_idx}.attn.wo_a"
+            for suffix, tensor in tensors.items():
+                # Split along axis=1 (input dimension in quantized format)
+                # weight: (out_dim, in_dim_packed) -> split in_dim_packed
+                # scales: (out_dim, in_dim/group_size) -> split axis=1
+                # biases: same shape as scales -> split axis=1
+                if tensor.ndim == 2:
+                    chunk_size = tensor.shape[1] // n_groups
+                    for g in range(n_groups):
+                        start = g * chunk_size
+                        end = start + chunk_size
+                        new_weights[f"{prefix}.{g}.{suffix}"] = tensor[:, start:end]
+                elif tensor.ndim == 1:
+                    # Scalar/bias per output dim -- replicate to each group
+                    for g in range(n_groups):
+                        new_weights[f"{prefix}.{g}.{suffix}"] = tensor
+                else:
+                    # Unexpected shape, keep original
+                    new_weights[f"{prefix}.{suffix}"] = tensor
+
+        return new_weights
 
     @staticmethod
     def _dequant_scaled_weights(weights):
