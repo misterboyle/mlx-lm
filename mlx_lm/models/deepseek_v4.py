@@ -1832,8 +1832,10 @@ class Model(nn.Module):
             nk = nk.replace(".mlp.shared_experts.", ".ffn.shared_experts.")
             # mlp.gate.* -> ffn.gate.*
             nk = nk.replace(".mlp.gate.", ".ffn.gate.")
-            # Bare switch_mlp (no mlp. wrapper) -> ffn.experts
-            if ".switch_mlp." in nk and ".ffn.experts." not in nk:
+            # ffn.switch_mlp -> ffn.experts (Thump604 format, already under ffn.)
+            nk = nk.replace(".ffn.switch_mlp.", ".ffn.experts.")
+            # Bare switch_mlp (no ffn. or mlp. wrapper)
+            if ".switch_mlp." in nk:
                 nk = nk.replace(".switch_mlp.", ".ffn.experts.")
 
             # --- Shared experts: gate_proj/up_proj/down_proj -> w1/w3/w2 ---
