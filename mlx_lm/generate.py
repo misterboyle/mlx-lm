@@ -260,7 +260,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
-    if not mx.metal.is_available():
+    if not mx.metal.is_available() or not hasattr(mx, "device_info"):
         try:
             yield
         finally:
