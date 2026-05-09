@@ -339,7 +339,6 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
-
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -588,7 +587,7 @@ def speculative_generate_step(
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            f"Speculative decoding requires a trimmable prompt cache (got {types})."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -1568,6 +1567,9 @@ class BatchGenerator:
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
         stream=None,
+        turbo_kv_bits: Optional[int] = None,
+        turbo_fp16_layers: int = 1,
+        turbo_v_bits: Optional[int] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1578,6 +1580,9 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.turbo_kv_bits = turbo_kv_bits
+        self.turbo_fp16_layers = turbo_fp16_layers
+        self.turbo_v_bits = turbo_v_bits
 
         self._stream = stream or generation_stream
 
@@ -1717,13 +1722,23 @@ class BatchGenerator:
         if self.max_kv_size is None:
             logging.info(
                 f"[TURBO] BatchGenerator._make_new_cache (batch) CALL SITE: "
-                f"no turbo params (batch path, max_kv_size={self.max_kv_size})"
+                f"turbo_kv_bits={self.turbo_kv_bits}, "
+                f"turbo_fp16_layers={self.turbo_fp16_layers}, "
+                f"turbo_v_bits={self.turbo_v_bits}"
             )
-            return cache.make_prompt_cache(self.model)
+            return cache.make_prompt_cache(
+                self.model,
+                turbo_kv_bits=self.turbo_kv_bits,
+                turbo_fp16_layers=self.turbo_fp16_layers,
+                turbo_v_bits=self.turbo_v_bits,
+            )
 
         logging.info(
             f"[TURBO] BatchGenerator._make_new_cache (batch, rotating) CALL SITE: "
-            f"no turbo params (batch path, max_kv_size={self.max_kv_size})"
+            f"turbo_kv_bits={self.turbo_kv_bits}, "
+            f"turbo_fp16_layers={self.turbo_fp16_layers}, "
+            f"turbo_v_bits={self.turbo_v_bits}, "
+            f"max_kv_size={self.max_kv_size}"
         )
         return [
             (
@@ -1731,7 +1746,12 @@ class BatchGenerator:
                 if isinstance(ci, KVCache)
                 else ci
             )
-            for ci in cache.make_prompt_cache(self.model)
+            for ci in cache.make_prompt_cache(
+                self.model,
+                turbo_kv_bits=self.turbo_kv_bits,
+                turbo_fp16_layers=self.turbo_fp16_layers,
+                turbo_v_bits=self.turbo_v_bits,
+            )
         ]
 
     def _find_uids(self, uids):
@@ -2084,7 +2104,9 @@ def main():
         from .models.expert_offload import enable_expert_offloading
 
         n_layers = enable_expert_offloading(
-            model, model_path, max_resident_experts=args.max_resident_experts,
+            model,
+            model_path,
+            max_resident_experts=args.max_resident_experts,
         )
         if n_layers > 0:
             print(

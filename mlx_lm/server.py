@@ -358,7 +358,9 @@ class ModelProvider:
             from .models.expert_offload import enable_expert_offloading
 
             n_layers = enable_expert_offloading(
-                model, model_path, max_resident_experts=max_re,
+                model,
+                model_path,
+                max_resident_experts=max_re,
             )
             if n_layers > 0:
                 logging.info(
@@ -464,15 +466,11 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
-        self._turbo_kv_bits = getattr(
-            model_provider.cli_args, "turbo_kv_bits", None
-        )
+        self._turbo_kv_bits = getattr(model_provider.cli_args, "turbo_kv_bits", None)
         self._turbo_fp16_layers = getattr(
             model_provider.cli_args, "turbo_fp16_layers", 1
         )
-        self._turbo_v_bits = getattr(
-            model_provider.cli_args, "turbo_v_bits", None
-        )
+        self._turbo_v_bits = getattr(model_provider.cli_args, "turbo_v_bits", None)
         logging.info(
             f"[TURBO] ResponseGenerator initialized: "
             f"turbo_kv_bits={self._turbo_kv_bits} (type={type(self._turbo_kv_bits).__name__}), "
@@ -537,9 +535,13 @@ class ResponseGenerator:
             indices_str = ", ".join(str(i) for i in info["indices"][:5])
             if len(info["indices"]) > 5:
                 indices_str += f" ... (+{len(info['indices']) - 5} more)"
-            logging.info(f"    {name:30s}  {info['count']:3d} layers  "
-                         f"[{indices_str}]  {gb:.3f} GB ({info['nbytes'] / 1024 / 1024:.0f} MB)")
-        logging.info(f"  Total KV cache memory: {total_gb:.3f} GB ({total_bytes / 1024 / 1024:.0f} MB)")
+            logging.info(
+                f"    {name:30s}  {info['count']:3d} layers  "
+                f"[{indices_str}]  {gb:.3f} GB ({info['nbytes'] / 1024 / 1024:.0f} MB)"
+            )
+        logging.info(
+            f"  Total KV cache memory: {total_gb:.3f} GB ({total_bytes / 1024 / 1024:.0f} MB)"
+        )
         logging.info("=" * 60)
 
     def _next_request(self, timeout=None):
@@ -897,6 +899,9 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         stream=generation_stream,
+                        turbo_kv_bits=self._turbo_kv_bits,
+                        turbo_fp16_layers=self._turbo_fp16_layers,
+                        turbo_v_bits=self._turbo_v_bits,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue

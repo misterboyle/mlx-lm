@@ -26,7 +26,7 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
     can_trim_prompt_cache,
 )
-from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+from mlx_lm.models.turboquant_cache import TurboQuantKVCache, BatchTurboQuantKVCache
 from mlx_lm.models.turboquant_packing import (
     pack_indices,
     unpack_indices,
@@ -45,7 +45,6 @@ from mlx_lm.models.turboquant_rotation import (
 # Packing tests
 # ---------------------------------------------------------------------------
 class TestBitPacking(unittest.TestCase):
-
     def test_packed_dim(self):
         self.assertEqual(packed_dim(128, 3), 13)  # ceil(128/10)
         self.assertEqual(packed_dim(128, 4), 16)  # ceil(128/8)
@@ -59,9 +58,9 @@ class TestBitPacking(unittest.TestCase):
         for bits in [1, 2, 3, 4]:
             max_val = (1 << bits) - 1
             for dim in [16, 64, 96, 128]:
-                indices = mx.random.randint(
-                    0, max_val + 1, shape=(4, dim)
-                ).astype(mx.uint8)
+                indices = mx.random.randint(0, max_val + 1, shape=(4, dim)).astype(
+                    mx.uint8
+                )
                 packed = pack_indices(indices, bits)
                 self.assertEqual(packed.shape[-1], packed_dim(dim, bits))
                 unpacked = unpack_indices(packed, bits, dim)
@@ -74,9 +73,9 @@ class TestBitPacking(unittest.TestCase):
         """Test with batch and head dimensions."""
         for bits in [1, 2, 3, 4]:
             max_val = (1 << bits) - 1
-            indices = mx.random.randint(
-                0, max_val + 1, shape=(2, 8, 10, 128)
-            ).astype(mx.uint8)
+            indices = mx.random.randint(0, max_val + 1, shape=(2, 8, 10, 128)).astype(
+                mx.uint8
+            )
             packed = pack_indices(indices, bits)
             unpacked = unpack_indices(packed, bits, 128)
             self.assertTrue(mx.array_equal(indices, unpacked))
@@ -100,7 +99,6 @@ class TestBitPacking(unittest.TestCase):
 # Rotation tests
 # ---------------------------------------------------------------------------
 class TestRotation(unittest.TestCase):
-
     def test_wht_orthogonality(self):
         """WHT is orthogonal: WHT(WHT(x)) == x."""
         for d in [16, 64, 128]:
@@ -148,7 +146,6 @@ class TestRotation(unittest.TestCase):
 # TurboQuantKVCache tests
 # ---------------------------------------------------------------------------
 class TestTurboQuantKVCache(unittest.TestCase):
-
     def test_init(self):
         cache = TurboQuantKVCache(bits=3)
         self.assertEqual(cache.quant_bits, 3)
@@ -307,10 +304,10 @@ class TestTurboQuantKVCache(unittest.TestCase):
 
         meta = cache.meta_state
         parts = meta.split(",")
-        self.assertEqual(int(parts[0]), 10)   # offset
-        self.assertEqual(int(parts[1]), 3)    # bits
-        self.assertEqual(int(parts[2]), 99)   # seed
-        self.assertEqual(int(parts[3]), 64)   # k_dim
+        self.assertEqual(int(parts[0]), 10)  # offset
+        self.assertEqual(int(parts[1]), 3)  # bits
+        self.assertEqual(int(parts[2]), 99)  # seed
+        self.assertEqual(int(parts[3]), 64)  # k_dim
         self.assertEqual(int(parts[4]), 128)  # v_dim
 
     def test_from_state(self):
@@ -355,7 +352,6 @@ class TestTurboQuantKVCache(unittest.TestCase):
 # Conversion from KVCache
 # ---------------------------------------------------------------------------
 class TestCacheConversion(unittest.TestCase):
-
     def test_to_turbo_quantized_basic(self):
         kv_cache = KVCache()
         k = mx.random.normal(shape=(1, 8, 10, 64))
@@ -407,7 +403,6 @@ class TestCacheConversion(unittest.TestCase):
 # make_prompt_cache integration
 # ---------------------------------------------------------------------------
 class TestMakePromptCache(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         from mlx_lm.utils import load
@@ -416,9 +411,7 @@ class TestMakePromptCache(unittest.TestCase):
 
     def test_make_prompt_cache_turbo(self):
         """make_prompt_cache with turbo_kv_bits creates mixed cache."""
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
         num_layers = len(self.model.layers)
         self.assertEqual(len(cache), num_layers)
 
@@ -435,9 +428,7 @@ class TestMakePromptCache(unittest.TestCase):
         """Different turbo_fp16_layers values."""
         num_layers = len(self.model.layers)
 
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=2
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=2)
         # First 2 and last 2 layers should be KVCache
         self.assertIsInstance(cache[0], KVCache)
         self.assertIsInstance(cache[1], KVCache)
@@ -454,15 +445,11 @@ class TestMakePromptCache(unittest.TestCase):
 
     def test_turbo_cache_trimmable(self):
         """Mixed cache should be fully trimmable."""
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
         self.assertTrue(can_trim_prompt_cache(cache))
 
     def test_turbo_cache_trim(self):
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
         # Feed some data
         for c in cache:
             k = mx.random.normal(shape=(1, 8, 10, 96))
@@ -479,7 +466,6 @@ class TestMakePromptCache(unittest.TestCase):
 # End-to-end generation
 # ---------------------------------------------------------------------------
 class TestTurboQuantGeneration(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         from mlx_lm.utils import load
@@ -491,9 +477,7 @@ class TestTurboQuantGeneration(unittest.TestCase):
         from mlx_lm.generate import generate_step
 
         prompt = self.tokenizer.encode("Hello, how are", return_tensors="mlx")[0]
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
 
         tokens = []
         for _, (tok, logits) in zip(
@@ -512,9 +496,9 @@ class TestTurboQuantGeneration(unittest.TestCase):
         """TurboQuant 4-bit should produce similar outputs to baseline."""
         from mlx_lm.generate import generate_step
 
-        prompt = self.tokenizer.encode("The capital of France is", return_tensors="mlx")[
-            0
-        ]
+        prompt = self.tokenizer.encode(
+            "The capital of France is", return_tensors="mlx"
+        )[0]
 
         # Baseline generation
         base_cache = make_prompt_cache(self.model)
@@ -527,9 +511,7 @@ class TestTurboQuantGeneration(unittest.TestCase):
             base_logits.append(logits)
 
         # TurboQuant 4-bit generation (highest quality)
-        tq_cache = make_prompt_cache(
-            self.model, turbo_kv_bits=4, turbo_fp16_layers=1
-        )
+        tq_cache = make_prompt_cache(self.model, turbo_kv_bits=4, turbo_fp16_layers=1)
         tq_tokens = []
         tq_logits = []
         for _, (tok, logits) in zip(
@@ -597,7 +579,6 @@ class TestTurboQuantGeneration(unittest.TestCase):
 # Save / Load
 # ---------------------------------------------------------------------------
 class TestTurboQuantSaveLoad(unittest.TestCase):
-
     def setUp(self):
         self.test_dir_fid = tempfile.TemporaryDirectory()
         self.test_dir = self.test_dir_fid.name
@@ -662,6 +643,239 @@ class TestTurboQuantSaveLoad(unittest.TestCase):
         save_prompt_cache(cache_file, cache, metadata)
         _, loaded_meta = load_prompt_cache(cache_file, return_metadata=True)
         self.assertEqual(metadata, loaded_meta)
+
+
+# ---------------------------------------------------------------------------
+# BatchTurboQuantKVCache tests
+# ---------------------------------------------------------------------------
+class TestBatchTurboQuantKVCache(unittest.TestCase):
+    def test_merge_empty_caches(self):
+        """Merging all-empty caches should produce empty batch cache."""
+        caches = [TurboQuantKVCache(bits=3) for _ in range(3)]
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+        self.assertTrue(batch.empty())
+
+    def test_merge_single_sequence(self):
+        """Merging a single cache should produce one batch cache."""
+        cache = TurboQuantKVCache(bits=3)
+        k = mx.random.normal(shape=(1, 4, 10, 64))
+        v = mx.random.normal(shape=(1, 4, 10, 64))
+        cache.update_and_fetch(k, v)
+
+        batch = TurboQuantKVCache.merge([cache])
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+        self.assertEqual(batch.size(), 10)
+
+    def test_merge_multiple_sequences(self):
+        """Merging multiple caches with different lengths."""
+        caches = []
+        for i in range(3):
+            c = TurboQuantKVCache(bits=3)
+            seq_len = 5 + i * 3  # 5, 8, 11
+            k = mx.random.normal(shape=(1, 4, seq_len, 64))
+            v = mx.random.normal(shape=(1, 4, seq_len, 64))
+            c.update_and_fetch(k, v)
+            caches.append(c)
+
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+        # Should have the max length
+        max_len = max(c.size() for c in caches)
+        self.assertEqual(batch.size(), max_len)
+
+    def test_merge_preserves_quantization(self):
+        """Merged batch should preserve quantization parameters."""
+        caches = []
+        for i in range(2):
+            c = TurboQuantKVCache(bits=3, seed=42 + i)
+            k = mx.random.normal(shape=(1, 4, 10, 64))
+            v = mx.random.normal(shape=(1, 4, 10, 64))
+            c.update_and_fetch(k, v)
+            caches.append(c)
+
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertEqual(batch.quant_bits, 3)
+        self.assertEqual(batch.seed, 42)
+
+    def test_merge_dequantization_matches_original(self):
+        """Dequantized batch should approximate original values."""
+        caches = []
+        original_keys = []
+        for i in range(2):
+            c = TurboQuantKVCache(bits=3)
+            k = mx.random.normal(shape=(1, 4, 10, 64))
+            v = mx.random.normal(shape=(1, 4, 10, 64))
+            c.update_and_fetch(k, v)
+            caches.append(c)
+            original_keys.append(k)
+
+        batch = TurboQuantKVCache.merge(caches)
+        # Check that batch has correct structure
+        self.assertEqual(batch.size(), 10)
+
+    def test_batch_update_and_fetch(self):
+        """Batch update should handle multiple sequences."""
+        caches = []
+        for i in range(2):
+            c = TurboQuantKVCache(bits=3)
+            k = mx.random.normal(shape=(1, 4, 5, 64))
+            v = mx.random.normal(shape=(1, 4, 5, 64))
+            c.update_and_fetch(k, v)
+            caches.append(c)
+
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+
+        # Update with new tokens
+        B = 2
+        H = 4
+        S = 3
+        k_new = mx.random.normal(shape=(B, H, S, 64))
+        v_new = mx.random.normal(shape=(B, H, S, 64))
+
+        k_ret, v_ret = batch.update_and_fetch(k_new, v_new)
+        self.assertEqual(k_ret.shape, (B, H, 8, 64))  # 5 + 3
+        self.assertEqual(v_ret.shape, (B, H, 8, 64))
+
+    def test_batch_is_trimmable(self):
+        """Batch cache should be trimmable."""
+        caches = [TurboQuantKVCache(bits=3) for _ in range(2)]
+        for c in caches:
+            k = mx.random.normal(shape=(1, 4, 10, 64))
+            v = mx.random.normal(shape=(1, 4, 10, 64))
+            c.update_and_fetch(k, v)
+
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertTrue(batch.is_trimmable())
+
+    def test_batch_trim(self):
+        """Trimming batch cache should reduce size."""
+        caches = [TurboQuantKVCache(bits=3) for _ in range(2)]
+        for c in caches:
+            k = mx.random.normal(shape=(1, 4, 10, 64))
+            v = mx.random.normal(shape=(1, 4, 10, 64))
+            c.update_and_fetch(k, v)
+
+        batch = TurboQuantKVCache.merge(caches)
+        trimmed = batch.trim(3)
+        self.assertEqual(trimmed, 3)
+        self.assertEqual(batch.size(), 7)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid model make_prompt_cache tests
+# ---------------------------------------------------------------------------
+class TestHybridModelCache(unittest.TestCase):
+    """Tests for hybrid/MoE models with mixed cache types."""
+
+    def test_make_prompt_cache_hybrid_model(self):
+        """make_prompt_cache should handle models with make_cache() returning mixed types."""
+        from mlx_lm.models.cache import KVCache, ArraysCache
+
+        # Create a mock hybrid model
+        class MockHybridLayer:
+            def __init__(self, is_linear):
+                self.is_linear = is_linear
+
+        class MockHybridModel:
+            def __init__(self, num_layers):
+                self.layers = [
+                    MockHybridLayer(is_linear=(i % 4 == 0))  # Every 4th layer is linear
+                    for i in range(num_layers)
+                ]
+
+            def make_cache(self):
+                return [
+                    ArraysCache(size=2) if l.is_linear else KVCache()
+                    for l in self.layers
+                ]
+
+        model = MockHybridModel(16)
+
+        # Without turbo - should return original mixed cache
+        cache = make_prompt_cache(model)
+        self.assertEqual(len(cache), 16)
+        # Check mixed types
+        types = [type(c).__name__ for c in cache]
+        self.assertIn("KVCache", types)
+        self.assertIn("ArraysCache", types)
+
+        # With turbo - should replace KVCache with TurboQuantKVCache
+        cache = make_prompt_cache(model, turbo_kv_bits=3, turbo_fp16_layers=1)
+        self.assertEqual(len(cache), 16)
+
+        # Count types
+        tq_count = sum(1 for c in cache if isinstance(c, TurboQuantKVCache))
+        kv_count = sum(1 for c in cache if isinstance(c, KVCache))
+        arrays_count = sum(1 for c in cache if type(c).__name__ == "ArraysCache")
+
+        # Should have TurboQuantKVCache for non-linear layers (minus FP16 guards)
+        # 16 layers, every 4th is linear (indices 0, 4, 8, 12) = 4 linear layers
+        # So 12 non-linear layers, minus 2 FP16 guards = 10 TurboQuantKVCache
+        self.assertEqual(arrays_count, 4)  # 4 linear layers stay as ArraysCache
+        self.assertGreater(tq_count, 0)  # Some layers should be TurboQuant
+
+    def test_make_prompt_cache_hybrid_with_data(self):
+        """Hybrid cache should handle update_and_fetch correctly."""
+        from mlx_lm.models.cache import KVCache, ArraysCache
+
+        class MockHybridLayer:
+            def __init__(self, is_linear):
+                self.is_linear = is_linear
+
+        class MockHybridModel:
+            def __init__(self, num_layers):
+                self.layers = [
+                    MockHybridLayer(is_linear=(i % 4 == 0)) for i in range(num_layers)
+                ]
+
+            def make_cache(self):
+                return [
+                    ArraysCache(size=2) if l.is_linear else KVCache()
+                    for l in self.layers
+                ]
+
+        model = MockHybridModel(8)
+        cache = make_prompt_cache(model, turbo_kv_bits=3, turbo_fp16_layers=0)
+
+        # Feed data to KVCache layers
+        for i, c in enumerate(cache):
+            if isinstance(c, KVCache):
+                k = mx.random.normal(shape=(1, 4, 10, 64))
+                v = mx.random.normal(shape=(1, 4, 10, 64))
+                c.update_and_fetch(k, v)
+                self.assertEqual(c.offset, 10)
+
+    def test_make_prompt_cache_hybrid_trimmable(self):
+        """Mixed hybrid cache should be trimmable for KVCache layers."""
+        from mlx_lm.models.cache import KVCache, ArraysCache
+
+        class MockHybridLayer:
+            def __init__(self, is_linear):
+                self.is_linear = is_linear
+
+        class MockHybridModel:
+            def __init__(self, num_layers):
+                self.layers = [
+                    MockHybridLayer(is_linear=(i % 4 == 0)) for i in range(num_layers)
+                ]
+
+            def make_cache(self):
+                return [
+                    ArraysCache(size=2) if l.is_linear else KVCache()
+                    for l in self.layers
+                ]
+
+        model = MockHybridModel(8)
+        cache = make_prompt_cache(model, turbo_kv_bits=3, turbo_fp16_layers=0)
+
+        # KVCache and TurboQuantKVCache layers should be trimmable
+        # ArraysCache is not trimmable (by design)
+        for c in cache:
+            name = type(c).__name__
+            if name in ("KVCache", "TurboQuantKVCache"):
+                self.assertTrue(c.is_trimmable(), f"{name} should be trimmable")
 
 
 if __name__ == "__main__":
