@@ -434,6 +434,21 @@ class TurboQuantKVCache:
         c._deq_alloc = 0
         return c
 
+    def __getstate__(self):
+        """Serialize _dtype as string (mlx.core.Dtype is not pickle-able)."""
+        state = self.__dict__.copy()
+        dtype_val = state.get("_dtype")
+        if dtype_val is not None:
+            state["_dtype"] = TurboQuantKVCache._DTYPE_NAME.get(dtype_val, "float16")
+        return state
+
+    def __setstate__(self, state):
+        """Restore _dtype from string back to mlx.core.Dtype."""
+        dtype_val = state.get("_dtype")
+        if isinstance(dtype_val, str):
+            state["_dtype"] = TurboQuantKVCache._DTYPE_MAP.get(dtype_val, mx.float16)
+        self.__dict__.update(state)
+
     def is_trimmable(self):
         return True
 
@@ -506,6 +521,7 @@ class BatchTurboQuantKVCache:
         self.seed = seed
         self.v_bits = v_bits
         self.v_group_size = 64
+        self._right_padding = None
 
         # Packed key storage: (B, H, max_len, packed_dim)
         self.k_packed = None
@@ -873,6 +889,277 @@ class BatchTurboQuantKVCache:
 
         return create_attention_mask(*args, offset=self._idx, **kwargs)
 
+    def filter(self, batch_indices):
+        """In-place filter to keep just the given indices in the cache.
+
+        Mirrors BatchKVCache.filter: selects rows by index, then shifts
+        left to reduce padding.
+        """
+        # Convert to mx.array with proper dtype for indexing
+        if isinstance(batch_indices, list):
+            batch_indices = mx.array(batch_indices, dtype=mx.int32)
+
+        if len(batch_indices) == 0:
+            # Empty filter — clear all data
+            self.k_packed = None
+            self.k_norms = None
+            self._v_quant = None
+            self._v_scales = None
+            self._v_biases = None
+            self.v_packed = None
+            self.v_norms = None
+            self.offset = mx.array([], dtype=mx.int32)
+            self.left_padding = mx.array([], dtype=mx.int32)
+            self._idx = 0
+            return
+
+        if self.k_packed is not None:
+            self.k_packed = self.k_packed[batch_indices]
+            self.k_norms = self.k_norms[batch_indices]
+            if self.v_bits is not None:
+                self._v_quant = self._v_quant[batch_indices]
+                self._v_scales = self._v_scales[batch_indices]
+                self._v_biases = self._v_biases[batch_indices]
+            else:
+                self.v_packed = self.v_packed[batch_indices]
+                self.v_norms = self.v_norms[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        # Shift left to reduce padding
+        min_left_pad = int(self.left_padding.min().item())
+        if min_left_pad > 0:
+            if self.k_packed is not None:
+                self.k_packed = self.k_packed[..., min_left_pad:, :]
+                self.k_norms = self.k_norms[..., min_left_pad:]
+                if self.v_bits is not None:
+                    self._v_quant = self._v_quant[..., min_left_pad:, :]
+                    self._v_scales = self._v_scales[..., min_left_pad:, :]
+                    self._v_biases = self._v_biases[..., min_left_pad:, :]
+                else:
+                    self.v_packed = self.v_packed[..., min_left_pad:, :]
+                    self.v_norms = self.v_norms[..., min_left_pad:]
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        """Prepare cache for right-padded prompt processing.
+
+        Mirrors BatchKVCache.prepare: stores right-padding so finalize()
+        can roll data back to left-padded layout.
+        """
+        if left_padding is not None:
+            if self.k_packed is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchTurboQuantKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding = self.left_padding + left_padding
+            self.offset = self.offset - left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+        else:
+            self._right_padding = None
+
+    def finalize(self):
+        """Finalize right-padded prompt processing.
+
+        Mirrors BatchKVCache.finalize: rolls data left by the right-padding
+        amount, converting right-padding into left-padding.
+        """
+        if self._right_padding is None:
+            return
+
+        padding = self._right_padding
+        # Roll each sequence's data left by its right-padding amount
+        for i in range(self.left_padding.shape[0]):
+            shift = int(padding[i].item())
+            if shift == 0:
+                continue
+            slice_i = slice(i, i + 1)
+            if self.k_packed is not None:
+                self.k_packed[slice_i] = mx.roll(
+                    self.k_packed[slice_i], -shift, axis=2
+                )
+                self.k_norms[slice_i] = mx.roll(
+                    self.k_norms[slice_i], -shift, axis=1
+                )
+                if self.v_bits is not None:
+                    self._v_quant[slice_i] = mx.roll(
+                        self._v_quant[slice_i], -shift, axis=2
+                    )
+                    self._v_scales[slice_i] = mx.roll(
+                        self._v_scales[slice_i], -shift, axis=2
+                    )
+                    self._v_biases[slice_i] = mx.roll(
+                        self._v_biases[slice_i], -shift, axis=2
+                    )
+                else:
+                    self.v_packed[slice_i] = mx.roll(
+                        self.v_packed[slice_i], -shift, axis=2
+                    )
+                    self.v_norms[slice_i] = mx.roll(
+                        self.v_norms[slice_i], -shift, axis=1
+                    )
+        self.offset = self.offset - padding
+        self.left_padding = self.left_padding + padding
+        self._right_padding = None
+
+    def extend(self, other):
+        """In-place extend this cache with another batched cache.
+
+        Mirrors BatchKVCache.extend: right-justifies both caches to the
+        same length, then concatenates them vertically.
+        """
+        if self.k_packed is None and other.k_packed is None:
+            self.left_padding = mx.concatenate(
+                [self.left_padding, other.left_padding]
+            )
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+        L1 = L2 = 0
+        D = M = 0
+        if self.k_packed is not None:
+            B, H, L1, D = self.k_packed.shape
+            M = self._v_quant.shape[3] if self.v_bits is not None else self.v_packed.shape[3]
+        if other.k_packed is not None:
+            B, H, L2, D = other.k_packed.shape
+            M = other._v_quant.shape[3] if other.v_bits is not None else other.v_packed.shape[3]
+        max_size = max(L1, L2)
+
+        def pad(c):
+            kp = c.k_packed
+            kn = c.k_norms
+            # Initialize value storage variables for both quant modes
+            kv_quant = kv_scales = kv_biases = None
+            kv_packed = kv_norms = None
+            if kp is None:
+                Bc = c.offset.shape[0]
+                kp = mx.array([]).reshape(Bc, H, 0, D)
+                kn = mx.array([]).reshape(Bc, H, 0)
+                # Create placeholder value storage arrays using dimensions
+                # from the non-empty cache (D for keys, M for values)
+                if c.v_bits is not None:
+                    el_per_int = 8 * mx.uint32.size // c.v_bits
+                    v_qdim = M // el_per_int if M else 1
+                    v_sdim = c._v_dim // 64 if c._v_dim else 1
+                    kv_quant = mx.zeros((Bc, H, 0, v_qdim), dtype=mx.uint32)
+                    kv_scales = mx.zeros((Bc, H, 0, v_sdim), dtype=mx.float16)
+                    kv_biases = mx.zeros((Bc, H, 0, v_sdim), dtype=mx.float16)
+                else:
+                    kv_packed = mx.zeros((Bc, H, 0, M), dtype=mx.uint32)
+                    kv_norms = mx.zeros((Bc, H, 0), dtype=mx.float32)
+            else:
+                if c.v_bits is not None:
+                    kv_quant = c._v_quant
+                    kv_scales = c._v_scales
+                    kv_biases = c._v_biases
+                else:
+                    kv_packed = c.v_packed
+                    kv_norms = c.v_norms
+
+            # Compute padding for both empty and non-empty caches
+            left = max_idx - c._idx
+            right = max_size - kp.shape[2] - left
+            if right < 0:
+                kp = kp[..., :right, :]
+                kn = kn[..., :right]
+                if c.v_bits is not None:
+                    kv_quant = kv_quant[..., :right, :]
+                    kv_scales = kv_scales[..., :right, :]
+                    kv_biases = kv_biases[..., :right, :]
+                else:
+                    kv_packed = kv_packed[..., :right, :]
+                    kv_norms = kv_norms[..., :right]
+                right = 0
+            if left != 0 or right != 0:
+                pad_k = [(0, 0), (0, 0), (left, right), (0, 0)]
+                kp = mx.pad(kp, pad_k)
+                pad_n = [(0, 0), (0, 0), (left, right)]
+                kn = mx.pad(kn, pad_n)
+                if c.v_bits is not None:
+                    pad_vq = [(0, 0), (0, 0), (left, right), (0, 0)]
+                    kv_quant = mx.pad(kv_quant, pad_vq)
+                    pad_vs = [(0, 0), (0, 0), (left, right), (0, 0)]
+                    kv_scales = mx.pad(kv_scales, pad_vs)
+                    pad_vb = [(0, 0), (0, 0), (left, right), (0, 0)]
+                    kv_biases = mx.pad(kv_biases, pad_vb)
+                else:
+                    pad_vp = [(0, 0), (0, 0), (left, right), (0, 0)]
+                    kv_packed = mx.pad(kv_packed, pad_vp)
+                    pad_vn = [(0, 0), (0, 0), (left, right)]
+                    kv_norms = mx.pad(kv_norms, pad_vn)
+            left_padding = c.left_padding + left
+            return kp, kn, kv_quant, kv_scales, kv_biases, kv_packed, kv_norms, c.offset, left_padding
+
+        s_kp, s_kn, s_vq, s_vs, s_vb, s_vp, s_vn, s_off, s_lp = pad(self)
+        o_kp, o_kn, o_vq, o_vs, o_vb, o_vp, o_vn, o_off, o_lp = pad(other)
+
+        self.k_packed = mx.concatenate([s_kp, o_kp], axis=0)
+        self.k_norms = mx.concatenate([s_kn, o_kn], axis=0)
+        self.offset = mx.concatenate([s_off, o_off])
+        self.left_padding = mx.concatenate([s_lp, o_lp])
+
+        if self.v_bits is not None:
+            self._v_quant = mx.concatenate([s_vq, o_vq], axis=0)
+            self._v_scales = mx.concatenate([s_vs, o_vs], axis=0)
+            self._v_biases = mx.concatenate([s_vb, o_vb], axis=0)
+        else:
+            self.v_packed = mx.concatenate([s_vp, o_vp], axis=0)
+            self.v_norms = mx.concatenate([s_vn, o_vn], axis=0)
+
+        self._idx = max_idx
+
+    def extract(self, idx: int) -> "TurboQuantKVCache":
+        """Extract per-sequence TurboQuantKVCache from batched buffer.
+
+        Mirrors BatchKVCache.extract: pulls the left-padded slice for
+        sequence *idx* out of the batched packed storage and returns a
+        standalone TurboQuantKVCache with matching metadata.
+        """
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+        padding = int(self.left_padding[idx])
+        seq_len = self._idx - padding
+
+        if self.k_packed is None or seq_len == 0:
+            # Empty cache — return a fresh empty instance with metadata
+            cache = TurboQuantKVCache(bits=self.quant_bits, v_bits=self.v_bits)
+            cache._k_dim = self._k_dim
+            cache._v_dim = self._v_dim
+            cache._dtype = self._dtype
+            cache.quant_bits = self.quant_bits
+            cache.seed = self.seed
+            return cache
+
+        # Extract packed data for this sequence
+        k_packed = self.k_packed[idx : idx + 1, :, padding : padding + seq_len, :]
+        k_norms = self.k_norms[idx : idx + 1, :, padding : padding + seq_len]
+
+        if self.v_bits is not None:
+            v_quant = self._v_quant[idx : idx + 1, :, padding : padding + seq_len, :]
+            v_scales = self._v_scales[idx : idx + 1, :, padding : padding + seq_len, :]
+            v_biases = self._v_biases[idx : idx + 1, :, padding : padding + seq_len, :]
+            state = [k_packed, k_norms, v_quant, v_scales, v_biases]
+        else:
+            v_packed = self.v_packed[idx : idx + 1, :, padding : padding + seq_len, :]
+            v_norms = self.v_norms[idx : idx + 1, :, padding : padding + seq_len]
+            state = [k_packed, k_norms, v_packed, v_norms]
+
+        # Build meta_state string matching TurboQuantKVCache format
+        dtype_str = TurboQuantKVCache._DTYPE_NAME.get(self._dtype, "float16")
+        v_bits_str = str(self.v_bits) if self.v_bits is not None else "0"
+        meta_state = (
+            f"{seq_len},{self.quant_bits},{self.seed},"
+            f"{self._k_dim or 0},{self._v_dim or 0},"
+            f"{dtype_str},{v_bits_str}"
+        )
+
+        return TurboQuantKVCache.from_state(state, meta_state)
+
     @classmethod
     def from_state(cls, state, meta_state):
         obj = cls.__new__(cls)
@@ -898,3 +1185,18 @@ class BatchTurboQuantKVCache:
         obj.meta_state = meta_state
         obj.state = state
         return obj
+
+    def __getstate__(self):
+        """Serialize _dtype as string (mlx.core.Dtype is not pickle-able)."""
+        state = self.__dict__.copy()
+        dtype_val = state.get("_dtype")
+        if dtype_val is not None:
+            state["_dtype"] = TurboQuantKVCache._DTYPE_NAME.get(dtype_val, "float16")
+        return state
+
+    def __setstate__(self, state):
+        """Restore _dtype from string back to mlx.core.Dtype."""
+        dtype_val = state.get("_dtype")
+        if isinstance(dtype_val, str):
+            state["_dtype"] = TurboQuantKVCache._DTYPE_MAP.get(dtype_val, mx.float16)
+        self.__dict__.update(state)

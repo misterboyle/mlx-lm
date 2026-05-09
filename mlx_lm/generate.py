@@ -911,6 +911,15 @@ def _make_cache(model, left_padding, max_kv_size):
             return BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, CacheList):
             return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        elif type(c).__name__ == "TurboQuantKVCache":
+            from mlx_lm.models.turboquant_cache import BatchTurboQuantKVCache
+
+            return BatchTurboQuantKVCache(
+                left_padding,
+                bits=c.quant_bits,
+                seed=c.seed,
+                v_bits=c.v_bits,
+            )
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 

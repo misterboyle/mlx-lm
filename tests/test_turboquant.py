@@ -877,6 +877,379 @@ class TestHybridModelCache(unittest.TestCase):
             if name in ("KVCache", "TurboQuantKVCache"):
                 self.assertTrue(c.is_trimmable(), f"{name} should be trimmable")
 
+    def test_batch_extract_single_sequence(self):
+        """Extract from a batch with a single sequence."""
+        cache = TurboQuantKVCache(bits=3)
+        k = mx.random.normal(shape=(1, 4, 10, 64))
+        v = mx.random.normal(shape=(1, 4, 10, 64))
+        cache.update_and_fetch(k, v)
+
+        batch = TurboQuantKVCache.merge([cache])
+        extracted = batch.extract(0)
+
+        self.assertIsInstance(extracted, TurboQuantKVCache)
+        self.assertEqual(extracted.size(), 10)
+        self.assertEqual(extracted.quant_bits, 3)
+        self.assertEqual(extracted.seed, 42)
+
+        # Dequantized values should approximate the original (quantization loss)
+        ek, ev = extracted.dequantize()
+        self.assertEqual(ek.shape, (1, 4, 10, 64))
+        self.assertEqual(ev.shape, (1, 4, 10, 64))
+        self.assertTrue(mx.allclose(ek, k, 1.0, 1.0))
+
+    def test_batch_extract_multiple_sequences(self):
+        """Extract each sequence from a multi-sequence batch."""
+        caches = []
+        original_keys = []
+        for i in range(3):
+            c = TurboQuantKVCache(bits=3)
+            seq_len = 5 + i * 3  # 5, 8, 11
+            k = mx.random.normal(shape=(1, 4, seq_len, 64))
+            v = mx.random.normal(shape=(1, 4, seq_len, 64))
+            c.update_and_fetch(k, v)
+            caches.append(c)
+            original_keys.append(k)
+
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertEqual(batch.size(), 11)  # max length
+
+        for i, (orig_k, orig_c) in enumerate(zip(original_keys, caches)):
+            extracted = batch.extract(i)
+            self.assertIsInstance(extracted, TurboQuantKVCache)
+            self.assertEqual(extracted.size(), orig_c.size())
+
+            # Dequantized values should approximate the original (quantization loss)
+            ek, ev = extracted.dequantize()
+            self.assertEqual(ek.shape, (1, 4, orig_c.size(), 64))
+            self.assertTrue(mx.allclose(ek, orig_k, 1.0, 1.0))
+
+    def test_batch_extract_preserves_quantization_params(self):
+        """Extracted cache should preserve bits, seed, v_bits, dimensions."""
+        cache = TurboQuantKVCache(bits=2, seed=99, v_bits=4)
+        k = mx.random.normal(shape=(1, 4, 8, 64))
+        v = mx.random.normal(shape=(1, 4, 8, 128))
+        cache.update_and_fetch(k, v)
+
+        batch = TurboQuantKVCache.merge([cache])
+        extracted = batch.extract(0)
+
+        self.assertEqual(extracted.quant_bits, 2)
+        self.assertEqual(extracted.seed, 99)
+        self.assertEqual(extracted.v_bits, 4)
+        self.assertEqual(extracted._k_dim, 64)
+        self.assertEqual(extracted._v_dim, 128)
+
+    def test_batch_extract_empty_cache(self):
+        """Extract from an empty batch should return empty cache with metadata."""
+        caches = [TurboQuantKVCache(bits=3) for _ in range(2)]
+        batch = TurboQuantKVCache.merge(caches)
+        self.assertTrue(batch.empty())
+
+        extracted = batch.extract(0)
+        self.assertIsInstance(extracted, TurboQuantKVCache)
+        self.assertTrue(extracted.empty())
+        self.assertEqual(extracted.quant_bits, 3)
+
+    def test_batch_extract_mixed_lengths(self):
+        """Extract should handle sequences with different lengths (left-padding)."""
+        caches = []
+        for i in range(2):
+            c = TurboQuantKVCache(bits=3)
+            seq_len = 3 + i * 5  # 3, 8
+            k = mx.random.normal(shape=(1, 4, seq_len, 64))
+            v = mx.random.normal(shape=(1, 4, seq_len, 64))
+            c.update_and_fetch(k, v)
+            caches.append(c)
+
+        batch = TurboQuantKVCache.merge(caches)
+        # Short sequence (idx 0) should have left-padding
+        extracted_0 = batch.extract(0)
+        self.assertEqual(extracted_0.size(), 3)
+
+        # Long sequence (idx 1) should have no left-padding
+        extracted_1 = batch.extract(1)
+        self.assertEqual(extracted_1.size(), 8)
+
+    def test_batch_extract_state_roundtrip(self):
+        """Extracted cache should survive state roundtrip."""
+        cache = TurboQuantKVCache(bits=3)
+        k = mx.random.normal(shape=(1, 4, 10, 64))
+        v = mx.random.normal(shape=(1, 4, 10, 64))
+        cache.update_and_fetch(k, v)
+
+        batch = TurboQuantKVCache.merge([cache])
+        extracted = batch.extract(0)
+
+        # Serialize and deserialize
+        state = extracted.state
+        meta = extracted.meta_state
+        rebuilt = TurboQuantKVCache.from_state(state, meta)
+
+        self.assertEqual(rebuilt.size(), extracted.size())
+        self.assertEqual(rebuilt.quant_bits, extracted.quant_bits)
+        self.assertEqual(rebuilt._k_dim, extracted._k_dim)
+
+        # Dequantized values should match
+        rk, rv = rebuilt.dequantize()
+        ek, ev = extracted.dequantize()
+        self.assertTrue(mx.allclose(rk, ek, 1e-5, 1e-5))
+
+
+# ---------------------------------------------------------------------------
+# generate.py _make_cache / to_batch_cache tests
+# ---------------------------------------------------------------------------
+class TestBatchCacheConversion(unittest.TestCase):
+    """Tests for _make_cache (to_batch_cache) handling of TurboQuantKVCache."""
+
+    def test_to_batch_cache_turboquant(self):
+        """to_batch_cache should convert TurboQuantKVCache to BatchTurboQuantKVCache."""
+        from mlx_lm.generate import _make_cache
+
+        class MockLayer:
+            pass
+
+        class MockModel:
+            def __init__(self):
+                self.layers = [MockLayer() for _ in range(4)]
+
+            def make_cache(self):
+                from mlx_lm.models.cache import KVCache, ArraysCache
+
+                # Hybrid: every 2nd layer is ArraysCache (SSM)
+                return [
+                    TurboQuantKVCache(bits=3) if i % 2 == 0 else ArraysCache(size=2)
+                    for i in range(4)
+                ]
+
+        model = MockModel()
+        caches = _make_cache(model, left_padding=[0, 0], max_kv_size=None)
+
+        self.assertEqual(len(caches), 4)
+        # Even indices → BatchTurboQuantKVCache
+        self.assertIsInstance(caches[0], BatchTurboQuantKVCache)
+        self.assertIsInstance(caches[2], BatchTurboQuantKVCache)
+        # Odd indices → ArraysCache (kept as-is)
+        from mlx_lm.models.cache import ArraysCache
+
+        self.assertIsInstance(caches[1], ArraysCache)
+        self.assertIsInstance(caches[3], ArraysCache)
+
+    def test_to_batch_cache_turboquant_preserves_bits(self):
+        """to_batch_cache should preserve turboquant bits/seed/v_bits."""
+        from mlx_lm.generate import _make_cache
+
+        class MockLayer:
+            pass
+
+        class MockModel:
+            def __init__(self):
+                self.layers = [MockLayer()]
+
+            def make_cache(self):
+                return [TurboQuantKVCache(bits=2, seed=99, v_bits=4)]
+
+        model = MockModel()
+        caches = _make_cache(model, left_padding=[0], max_kv_size=None)
+
+        batch = caches[0]
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+        self.assertEqual(batch.quant_bits, 2)
+        self.assertEqual(batch.seed, 99)
+        self.assertEqual(batch.v_bits, 4)
+
+    def test_to_batch_cache_standard_turboquant(self):
+        """to_batch_cache should handle standard (non-hybrid) TurboQuant models."""
+        from mlx_lm.generate import _make_cache
+
+        class MockLayer:
+            pass
+
+        class MockModel:
+            def __init__(self):
+                self.layers = [MockLayer() for _ in range(4)]
+
+            def make_cache(self):
+                return [TurboQuantKVCache(bits=3) for _ in range(4)]
+
+        model = MockModel()
+        caches = _make_cache(model, left_padding=[0, 0], max_kv_size=None)
+
+        for c in caches:
+            self.assertIsInstance(c, BatchTurboQuantKVCache)
+
+
+class TestTurboQuantDeepCopy(unittest.TestCase):
+    """Verify deepcopy works on TurboQuant caches (mlx.core.Dtype is not pickle-able)."""
+
+    def test_turboquant_deepcopy(self):
+        """TurboQuantKVCache survives copy.deepcopy."""
+        import copy
+
+        cache = TurboQuantKVCache(bits=3, seed=42, v_bits=4)
+        # Simulate populated cache
+        B, H, S, k_dim, v_dim = 2, 8, 16, 128, 128
+        keys = mx.random.uniform(shape=(B, H, S, k_dim))
+        values = mx.random.uniform(shape=(B, H, S, v_dim))
+        cache.update_and_fetch(keys, values)
+
+        copied = copy.deepcopy(cache)
+        self.assertEqual(copied.size(), cache.size())
+        self.assertEqual(copied.quant_bits, cache.quant_bits)
+        self.assertEqual(copied.seed, cache.seed)
+        self.assertEqual(copied.v_bits, cache.v_bits)
+        self.assertIsNotNone(copied._dtype)
+        self.assertEqual(copied._dtype, cache._dtype)
+
+    def test_batch_turboquant_deepcopy(self):
+        """BatchTurboQuantKVCache survives copy.deepcopy."""
+        import copy
+
+        cache = BatchTurboQuantKVCache(left_padding=[0, 3], bits=3, seed=42, v_bits=4)
+        B, H, S, k_dim, v_dim = 2, 8, 16, 128, 128
+        keys = mx.random.uniform(shape=(B, H, S, k_dim))
+        values = mx.random.uniform(shape=(B, H, S, v_dim))
+        cache.update_and_fetch(keys, values)
+
+        copied = copy.deepcopy(cache)
+        self.assertEqual(copied.size(), cache.size())
+        self.assertEqual(copied.quant_bits, cache.quant_bits)
+        self.assertEqual(copied.seed, cache.seed)
+        self.assertEqual(copied.v_bits, cache.v_bits)
+        self.assertIsNotNone(copied._dtype)
+        self.assertEqual(copied._dtype, cache._dtype)
+
+    def test_batch_filter(self):
+        """BatchTurboQuantKVCache.filter keeps only specified indices."""
+        cache = BatchTurboQuantKVCache(left_padding=[2, 3, 4], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 3, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        # Filter to first two sequences
+        cache.filter([0, 1])
+        self.assertEqual(cache.size(), 2)
+        self.assertEqual(cache.left_padding.shape[0], 2)
+
+    def test_batch_filter_left_shift(self):
+        """BatchTurboQuantKVCache.filter left-shifts to reduce padding."""
+        cache = BatchTurboQuantKVCache(left_padding=[2, 3, 4], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 3, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        # Filter to first two sequences — min left_padding is 2
+        cache.filter([0, 1])
+        # After left shift, padding should be [0, 1]
+        self.assertEqual(int(cache.left_padding[0].item()), 0)
+        self.assertEqual(int(cache.left_padding[1].item()), 1)
+
+    def test_batch_filter_empty(self):
+        """BatchTurboQuantKVCache.filter with empty result clears cache."""
+        cache = BatchTurboQuantKVCache(left_padding=[2, 3], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 2, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        cache.filter([])
+        self.assertEqual(cache.size(), 0)
+
+    def test_batch_prepare(self):
+        """BatchTurboQuantKVCache.prepare stores right-padding for finalize."""
+        cache = BatchTurboQuantKVCache(left_padding=[0, 0], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 2, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        # Prepare with right padding
+        cache.prepare(right_padding=[2, 3])
+        self.assertIsNotNone(cache._right_padding)
+
+    def test_batch_finalize(self):
+        """BatchTurboQuantKVCache.finalize converts right-padding to left-padding."""
+        cache = BatchTurboQuantKVCache(left_padding=[0, 0], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 2, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        cache.prepare(right_padding=[2, 3])
+        cache.finalize()
+        # Right padding should be converted to left padding
+        self.assertEqual(int(cache.left_padding[0].item()), 2)
+        self.assertEqual(int(cache.left_padding[1].item()), 3)
+        self.assertIsNone(cache._right_padding)
+
+    def test_batch_finalize_no_right_padding(self):
+        """BatchTurboQuantKVCache.finalize with no right_padding is a no-op."""
+        cache = BatchTurboQuantKVCache(left_padding=[2, 3], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 2, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        cache.finalize()  # Should not crash
+        self.assertEqual(int(cache.left_padding[0].item()), 2)
+
+    def test_batch_extend(self):
+        """BatchTurboQuantKVCache.extend concatenates two batched caches."""
+        cache_a = BatchTurboQuantKVCache(left_padding=[2, 1, 2], bits=3, seed=42)
+        cache_b = BatchTurboQuantKVCache(left_padding=[3, 0], bits=3, seed=42)
+
+        B_a, H, S_a, k_dim, v_dim = 3, 1, 8, 1, 1
+        k = mx.zeros((B_a, H, S_a, k_dim))
+        v = mx.zeros((B_a, H, S_a, v_dim))
+        cache_a.update_and_fetch(k, v)
+
+        B_b, S_b = 2, 4
+        k = mx.zeros((B_b, H, S_b, k_dim))
+        v = mx.zeros((B_b, H, S_b, v_dim))
+        cache_b.update_and_fetch(k, v)
+
+        cache_a.extend(cache_b)
+        self.assertEqual(cache_a.left_padding.shape[0], 5)
+        self.assertEqual(cache_a.size(), 8)  # max sequence length after extend
+
+    def test_batch_extend_with_empty(self):
+        """Extending a batch cache when one side is empty uses correct batch size."""
+        c1 = TurboQuantKVCache(bits=3, seed=42)
+        c2 = TurboQuantKVCache(bits=3, seed=42)
+        c1.update_and_fetch(mx.ones((1, 8, 5, 64)), mx.ones((1, 8, 5, 64)))
+        c2.update_and_fetch(mx.ones((1, 8, 3, 64)), mx.ones((1, 8, 3, 64)))
+        batch_full = BatchTurboQuantKVCache.merge([c1, c2])
+
+        empty_caches = [TurboQuantKVCache(bits=3, seed=42) for _ in range(3)]
+        batch_empty = BatchTurboQuantKVCache.merge(empty_caches)
+
+        batch_full.extend(batch_empty)
+        self.assertEqual(batch_full.size(), 5)
+        self.assertEqual(batch_full.left_padding.shape[0], 5)
+
+    def test_batch_prepare_finalize_roundtrip(self):
+        """prepare + finalize should convert right-padding to left-padding."""
+        cache = BatchTurboQuantKVCache(left_padding=[0, 0], bits=3, seed=42)
+        B, H, S, k_dim, v_dim = 2, 1, 4, 8, 8
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        # Simulate prompt processing with right padding
+        cache.prepare(right_padding=[2, 3])
+        cache.finalize()
+
+        # After finalize, left_padding should reflect the right-padding amounts
+        self.assertEqual(int(cache.left_padding[0].item()), 2)
+        self.assertEqual(int(cache.left_padding[1].item()), 3)
+
+    def test_batch_filter_preserves_quantization(self):
+        """BatchTurboQuantKVCache.filter preserves quantization parameters."""
+        cache = BatchTurboQuantKVCache(left_padding=[2, 3, 4], bits=2, seed=99, v_bits=4)
+        B, H, S, k_dim, v_dim = 3, 1, 4, 128, 128
+        k, v = mx.zeros((B, H, S, k_dim)), mx.zeros((B, H, S, v_dim))
+        cache.update_and_fetch(k, v)
+
+        cache.filter([0, 2])
+        self.assertEqual(cache.quant_bits, 2)
+        self.assertEqual(cache.seed, 99)
+        self.assertEqual(cache.v_bits, 4)
+
 
 if __name__ == "__main__":
     unittest.main()
