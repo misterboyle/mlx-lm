@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import logging
 import copy
 from collections import deque
 from dataclasses import dataclass
@@ -10,6 +11,53 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
+
+logger = logging.getLogger(__name__)
+
+
+def _log_cache_stats(caches, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits):
+    """Log KV cache type breakdown and memory estimates."""
+    if not caches:
+        return
+
+    # Import packing helper for expected memory calculation
+    try:
+        from mlx_lm.models.turboquant_packing import packed_dim
+        has_packing = True
+    except ImportError:
+        has_packing = False
+
+    layer_types = {}
+    for i, c in enumerate(caches):
+        name = type(c).__name__
+        if name not in layer_types:
+            layer_types[name] = {"count": 0, "indices": [], "nbytes": 0}
+        layer_types[name]["count"] += 1
+        layer_types[name]["indices"].append(i)
+        layer_types[name]["nbytes"] += c.nbytes
+
+    total_bytes = sum(v["nbytes"] for v in layer_types.values())
+    total_gb = total_bytes / 1e9
+
+    logger.info("=" * 60)
+    logger.info("KV Cache Configuration")
+    logger.info(f"  Total layers: {len(caches)}")
+    if turbo_kv_bits is not None:
+        logger.info(f"  TurboQuant: {turbo_kv_bits}-bit (PolarQuant)")
+        if turbo_v_bits is not None:
+            logger.info(f"  Value quantization: {turbo_v_bits}-bit (affine)")
+        logger.info(f"  FP16 guard layers: {turbo_fp16_layers} first + {turbo_fp16_layers} last")
+    logger.info("")
+    logger.info("  Layer breakdown:")
+    for name, info in sorted(layer_types.items(), key=lambda x: -x[1]["count"]):
+        gb = info["nbytes"] / 1e9
+        indices_str = ", ".join(str(i) for i in info["indices"][:5])
+        if len(info["indices"]) > 5:
+            indices_str += f" ... (+{len(info['indices']) - 5} more)"
+        logger.info(f"    {name:25s}  {info['count']:3d} layers  "
+                     f"[{indices_str}]  {gb:.3f} GB ({info['nbytes'] / 1024 / 1024:.0f} MB)")
+    logger.info(f"  Total estimated cache: {total_gb:.3f} GB ({total_bytes / 1024 / 1024:.0f} MB)")
+    logger.info("=" * 60)
 
 
 def make_prompt_cache(
@@ -40,6 +88,24 @@ def make_prompt_cache(
             PolarQuant. Values tolerate simple quantization well.
             Default: ``None`` (use PolarQuant for values too).
     """
+    # Debug logging: trace the decision path
+    logger.info("=" * 60)
+    logger.info("make_prompt_cache called")
+    logger.info(f"  turbo_kv_bits={turbo_kv_bits}, turbo_fp16_layers={turbo_fp16_layers}, turbo_v_bits={turbo_v_bits}")
+    logger.info(f"  max_kv_size={max_kv_size}")
+    logger.info(f"  model has make_cache: {hasattr(model, 'make_cache')}")
+    logger.info(f"  model has layers: {hasattr(model, 'layers')}")
+    if hasattr(model, 'layers'):
+        logger.info(f"  model.layers count: {len(model.layers)}")
+        # Check for MLA
+        for i, layer in enumerate(model.layers[:1]):
+            attn = getattr(layer, "self_attn", None) or getattr(layer, "attn", None)
+            if attn is not None:
+                has_kv_lora = hasattr(attn, "kv_lora_rank")
+                logger.info(f"  layer 0 attn has kv_lora_rank: {has_kv_lora}")
+                if has_kv_lora:
+                    logger.info(f"    kv_lora_rank={attn.kv_lora_rank}")
+    
     if turbo_kv_bits is not None:
         # Check for MLA (Multi-Latent Attention) models.
         # Models with kv_lora_rank store compressed latents in the cache,
@@ -59,6 +125,9 @@ def make_prompt_cache(
 
     if hasattr(model, "make_cache"):
         default_cache = model.make_cache()
+        logger.info(f"  -> make_cache returned {len(default_cache)} caches")
+        cache_types = [type(c).__name__ for c in default_cache]
+        logger.info(f"  -> Cache types: {cache_types}")
         if turbo_kv_bits is not None:
             # Check that all layers use a compatible cache type.
             # Hybrid SSM/attention models (e.g. Qwen3.5) mix ArraysCache
@@ -71,7 +140,20 @@ def make_prompt_cache(
                         f"TurboQuant only works with standard multi-head "
                         f"attention (KVCache/RotatingKVCache)."
                     )
+            _log_cache_stats(default_cache, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits)
+            logger.info(
+                f"[TURBO] make_prompt_cache RETURNED (make_cache): "
+                f"{len(default_cache)} caches, "
+                f"types={[type(c).__name__ for c in default_cache]}"
+            )
+            return default_cache
         else:
+            _log_cache_stats(default_cache, None, 0, None)
+            logger.info(
+                f"[TURBO] make_prompt_cache RETURNED (no turbo, make_cache): "
+                f"{len(default_cache)} caches, "
+                f"types={[type(c).__name__ for c in default_cache]}"
+            )
             return default_cache
 
     num_layers = len(model.layers)
@@ -85,14 +167,23 @@ def make_prompt_cache(
                 caches.append(KVCache())
             else:
                 caches.append(TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits))
+        _log_cache_stats(caches, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits)
+        logger.info(
+            f"[TURBO] make_prompt_cache RETURNED: {len(caches)} caches, "
+            f"types={[type(c).__name__ for c in caches]}"
+        )
         return caches
 
     if max_kv_size is not None:
-        return [
+        result = [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]
+        _log_cache_stats(result, None, 0, None)
+        return result
     else:
-        return [KVCache() for _ in range(num_layers)]
+        result = [KVCache() for _ in range(num_layers)]
+        _log_cache_stats(result, None, 0, None)
+        return result
 
 
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):

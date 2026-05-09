@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import logging
 import sys
 import time
 from collections import deque
@@ -415,6 +416,11 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
+        logging.info(
+            f"[TURBO] stream_generate (single) CALL SITE: "
+            f"turbo_kv_bits={turbo_kv_bits}, turbo_fp16_layers={turbo_fp16_layers}, "
+            f"turbo_v_bits={turbo_v_bits}"
+        )
         prompt_cache = cache.make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
@@ -569,6 +575,10 @@ def speculative_generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
+        logging.info(
+            f"[TURBO] stream_generate (speculative) CALL SITE: "
+            f"no turbo params passed (speculative decoding path)"
+        )
         model_cache = cache.make_prompt_cache(model)
         draft_cache = cache.make_prompt_cache(draft_model)
     else:
@@ -1705,8 +1715,16 @@ class BatchGenerator:
 
     def _make_new_cache(self):
         if self.max_kv_size is None:
+            logging.info(
+                f"[TURBO] BatchGenerator._make_new_cache (batch) CALL SITE: "
+                f"no turbo params (batch path, max_kv_size={self.max_kv_size})"
+            )
             return cache.make_prompt_cache(self.model)
 
+        logging.info(
+            f"[TURBO] BatchGenerator._make_new_cache (batch, rotating) CALL SITE: "
+            f"no turbo params (batch path, max_kv_size={self.max_kv_size})"
+        )
         return [
             (
                 RotatingKVCache(max_size=self.max_kv_size)
