@@ -449,3 +449,21 @@ class BatchMixedQuantKVCache:
             self.offset -= padding
             self.left_padding += padding
             self._right_padding = None
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return []
+        return [x[..., : self._idx, :] for x in self.keys + self.values]
+
+    @state.setter
+    def state(self, v):
+        if not v:
+            return
+        if len(v) != 6:
+            raise ValueError(
+                f"BatchMixedQuantKVCache state expects 6 arrays, got {len(v)}"
+            )
+        self.keys = (v[0], v[1], v[2])
+        self.values = (v[3], v[4], v[5])
+        self._idx = self.keys[0].shape[2]
