@@ -134,7 +134,8 @@ def mixed_quantized_scaled_dot_product_attention(
         q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
 
     scores = mx.quantized_matmul(
-        queries, *q_keys, transpose=True, group_size=k_group_size, bits=k_bits
+        queries, q_keys[0], q_keys[1], q_keys[2],
+        transpose=True, group_size=k_group_size, bits=k_bits,
     )
     if mask is not None:
         if isinstance(mask, str):
@@ -148,7 +149,8 @@ def mixed_quantized_scaled_dot_product_attention(
             scores += mask
     scores = mx.softmax(scores, axis=-1, precise=True)
     out = mx.quantized_matmul(
-        scores, *q_values, transpose=False, group_size=v_group_size, bits=v_bits
+        scores, q_values[0], q_values[1], q_values[2],
+        transpose=False, group_size=v_group_size, bits=v_bits,
     )
 
     if n_repeats > 1:
