@@ -149,8 +149,25 @@ def make_prompt_cache(
             skipped_count = 0
             skipped_indices = []
 
+            # Find the first and last full-attention layers (KVCache type)
+            # to apply FP16 guard around them, not around arbitrary layer indices.
+            # In hybrid models the first layers may be SSM (ArraysCache), so
+            # protecting layer 0 would protect the wrong thing.
+            attention_indices = [
+                i for i, c in enumerate(default_cache)
+                if isinstance(c, (KVCache, RotatingKVCache))
+            ]
+            if attention_indices:
+                first_attn = attention_indices[0]
+                last_attn = attention_indices[-1]
+            else:
+                # No standard attention layers found — fall back to layer indices
+                first_attn = 0
+                last_attn = num_layers - 1
+
             for i, c in enumerate(default_cache):
-                if i < turbo_fp16_layers or i >= num_layers - turbo_fp16_layers:
+                if (first_attn <= i <= first_attn + turbo_fp16_layers - 1) or \
+                   (last_attn - turbo_fp16_layers + 1 <= i <= last_attn):
                     # FP16 guard layer — keep original cache type
                     quantized.append(c)
                     skipped_count += 1
@@ -178,6 +195,14 @@ def make_prompt_cache(
             if skipped_indices:
                 logger.info(
                     f"  Skipped layers (FP16 guard or non-KV cache): {skipped_indices}"
+                )
+            # Log the actual FP16 guard range for clarity
+            if attention_indices:
+                guard_start = min(first_attn, last_attn - turbo_fp16_layers + 1)
+                guard_end = max(first_attn + turbo_fp16_layers - 1, last_attn)
+                logger.info(
+                    f"  FP16 guard range: layers [{guard_start}..{guard_end}] "
+                    f"(first attn={first_attn}, last attn={last_attn})"
                 )
             return quantized
         else:

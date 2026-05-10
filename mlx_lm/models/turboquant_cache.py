@@ -580,6 +580,12 @@ class BatchTurboQuantKVCache:
         H = first.k_packed.shape[1] if first.k_packed is not None else 8
         dt = first._dtype if first._dtype is not None else mx.float16
 
+        # Recompute packed dims if not yet set (cache restored from state)
+        if k_pdim is None and k_dim is not None:
+            k_pdim = packed_dim(k_dim, bits)
+        if v_pdim is None and v_dim is not None and v_bits is None:
+            v_pdim = packed_dim(v_dim, bits)
+
         # Allocate batched storage
         cache = cls(padding, bits=bits, seed=seed, v_bits=v_bits)
         cache._k_dim = k_dim
