@@ -1385,7 +1385,7 @@ class DeepseekV4Attention(nn.Module):
                     rows = slice(g * self.o_lora_rank, (g + 1) * self.o_lora_rank)
                     pieces.append(output[:, :, g, :] @ self.wo_a.weight[rows].T)
                 output = mx.concatenate(pieces, axis=-1)
-        elif B == 1 and L == 1 and hasattr(self.wo_a[0], 'bits') and self.wo_a[0].bits == 4:
+        elif B == 1 and L == 1 and hasattr(self.wo_a[0], 'bits') and self.wo_a[0].bits in (4, 8):
             from .fused_moe_kernel import fused_grouped_wo
             x_flat = output.reshape(self.n_groups, -1)
             output = fused_grouped_wo(x_flat, self.wo_a).astype(output.dtype)
