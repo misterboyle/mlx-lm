@@ -1251,5 +1251,160 @@ class TestTurboQuantDeepCopy(unittest.TestCase):
         self.assertEqual(cache.v_bits, 4)
 
 
+# ---------------------------------------------------------------------------
+# MixedQuantKVCache tests
+# ---------------------------------------------------------------------------
+class TestMixedQuantKVCache(unittest.TestCase):
+    """Tests for MixedQuantKVCache (K@8-bit, V@4-bit)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+        cls.MixedQuantKVCache = MixedQuantKVCache
+        from mlx_lm.utils import load
+
+        cls.model, cls.tokenizer = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+
+    def test_make_prompt_cache_mixed_quant(self):
+        """make_prompt_cache with kv_bits creates MixedQuantKVCache."""
+        caches = make_prompt_cache(
+            self.model,
+            kv_bits=(8, 4),
+            kv_group_size=64,
+        )
+        self.assertEqual(len(caches), len(self.model.model.layers))
+        for c in caches:
+            self.assertIsInstance(c, self.MixedQuantKVCache)
+            self.assertEqual(c.k_bits, 8)
+            self.assertEqual(c.v_bits, 4)
+            self.assertEqual(c.k_group_size, 64)
+            self.assertEqual(c.v_group_size, 64)
+
+    def test_make_prompt_cache_mixed_quant_with_make_cache(self):
+        """make_prompt_cache with kv_bits handles models with make_cache()."""
+        # Create a mock model with make_cache
+        class MockModel:
+            def __init__(self):
+                self.layers = [None] * 4
+
+            def make_cache(self):
+                return [KVCache() for _ in range(4)]
+
+        model = MockModel()
+        caches = make_prompt_cache(model, kv_bits=(8, 4))
+        self.assertEqual(len(caches), 4)
+        for c in caches:
+            self.assertIsInstance(c, self.MixedQuantKVCache)
+
+    def test_mixed_quant_update_and_fetch(self):
+        """MixedQuantKVCache should handle update_and_fetch correctly."""
+        cache = self.MixedQuantKVCache(k_bits=8, v_bits=4)
+        B, H, S, k_dim, v_dim = 1, 8, 10, 128, 128
+        k = mx.random.normal((B, H, S, k_dim))
+        v = mx.random.normal((B, H, S, v_dim))
+
+        dk, dv = cache.update_and_fetch(k, v)
+        # update_and_fetch returns tuples of 3 arrays each
+        self.assertEqual(len(dk), 3)
+        self.assertEqual(len(dv), 3)
+        self.assertEqual(cache.offset, S)
+
+    def test_mixed_quant_dequantization_accuracy(self):
+        """Dequantized values should approximate originals."""
+        cache = self.MixedQuantKVCache(k_bits=8, v_bits=4)
+        B, H, S, k_dim, v_dim = 1, 8, 10, 128, 128
+        k = mx.random.normal((B, H, S, k_dim))
+        v = mx.random.normal((B, H, S, v_dim))
+
+        dk, dv = cache.update_and_fetch(k, v)
+
+        # Dequantize back to fp16
+        k_fp = mx.dequantize(*dk, group_size=64, bits=8)
+        v_fp = mx.dequantize(*dv, group_size=64, bits=4)
+
+        # Check cosine similarity for K
+        k_cos = float(mx.sum(k_fp * k) / (mx.linalg.norm(k_fp) * mx.linalg.norm(k) + 1e-8))
+        # Check cosine similarity for V
+        v_cos = float(mx.sum(v_fp * v) / (mx.linalg.norm(v_fp) * mx.linalg.norm(v) + 1e-8))
+
+        self.assertGreater(k_cos, 0.95, "K dequantization quality too low")
+        self.assertGreater(v_cos, 0.90, "V dequantization quality too low")
+
+    def test_mixed_quant_not_trimmable(self):
+        """MixedQuantKVCache is not trimmable (by design)."""
+        cache = self.MixedQuantKVCache(k_bits=8, v_bits=4)
+        self.assertFalse(cache.is_trimmable())
+
+    def test_mixed_quant_nbytes(self):
+        """MixedQuantKVCache.nbytes should return non-zero after update."""
+        cache = self.MixedQuantKVCache(k_bits=8, v_bits=4)
+        self.assertEqual(cache.nbytes, 0)
+
+        B, H, S, k_dim, v_dim = 1, 8, 10, 128, 128
+        k = mx.random.normal((B, H, S, k_dim))
+        v = mx.random.normal((B, H, S, v_dim))
+
+        cache.update_and_fetch(k, v)
+        self.assertGreater(cache.nbytes, 0)
+
+    def test_mixed_quant_state_roundtrip(self):
+        """MixedQuantKVCache should survive state roundtrip."""
+        cache = self.MixedQuantKVCache(k_bits=8, v_bits=4)
+        B, H, S, k_dim, v_dim = 1, 8, 10, 128, 128
+        k = mx.random.normal((B, H, S, k_dim))
+        v = mx.random.normal((B, H, S, v_dim))
+
+        cache.update_and_fetch(k, v)
+        state = cache.state
+        meta_state = cache.meta_state
+
+        # Create new cache and restore state
+        new_cache = self.MixedQuantKVCache(k_bits=8, v_bits=4)
+        new_cache.state = state
+        new_cache.meta_state = meta_state
+
+        self.assertEqual(new_cache.offset, cache.offset)
+        self.assertEqual(new_cache.k_bits, 8)
+        self.assertEqual(new_cache.v_bits, 4)
+
+    def test_mixed_quant_from_kvcache(self):
+        """MixedQuantKVCache.from_kvcache should convert populated KVCache."""
+        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+
+        fp16_cache = KVCache()
+        B, H, S, k_dim, v_dim = 1, 8, 10, 128, 128
+        k = mx.random.normal((B, H, S, k_dim))
+        v = mx.random.normal((B, H, S, v_dim))
+        fp16_cache.update_and_fetch(k, v)
+
+        mixed_cache = MixedQuantKVCache.from_kvcache(fp16_cache, k_bits=8, v_bits=4)
+        self.assertIsInstance(mixed_cache, MixedQuantKVCache)
+        self.assertEqual(mixed_cache.offset, S)
+        self.assertEqual(mixed_cache.k_bits, 8)
+        self.assertEqual(mixed_cache.v_bits, 4)
+
+    def test_mixed_quant_to_kvcache(self):
+        """MixedQuantKVCache.to_kvcache should dequantize back to KVCache."""
+        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+        from mlx_lm.models.cache import KVCache
+
+        cache = MixedQuantKVCache(k_bits=8, v_bits=4)
+        B, H, S, k_dim, v_dim = 1, 8, 10, 128, 128
+        k = mx.random.normal((B, H, S, k_dim))
+        v = mx.random.normal((B, H, S, v_dim))
+
+        cache.update_and_fetch(k, v)
+        kv = cache.to_kvcache()
+
+        self.assertIsInstance(kv, KVCache)
+        self.assertEqual(kv.offset, S)
+
+        # Check dequantization quality
+        k_cos = float(mx.sum(kv.keys[..., :S, :] * k) /
+                      (mx.linalg.norm(kv.keys[..., :S, :]) * mx.linalg.norm(k) + 1e-8))
+        self.assertGreater(k_cos, 0.95, "K dequantization quality too low")
+
+
 if __name__ == "__main__":
     unittest.main()

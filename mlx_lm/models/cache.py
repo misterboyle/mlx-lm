@@ -73,6 +73,8 @@ def make_prompt_cache(
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
     turbo_v_bits: Optional[int] = None,
+    kv_bits: Optional[tuple[int, int]] = None,
+    kv_group_size: int = 64,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -94,12 +96,18 @@ def make_prompt_cache(
             quantization at the given bit width for values instead of
             PolarQuant. Values tolerate simple quantization well.
             Default: ``None`` (use PolarQuant for values too).
+        kv_bits (Optional[tuple[int, int]]): If provided, use mixed-precision
+            quantized KV cache with (k_bits, v_bits). E.g. (8, 4) for K@8-bit,
+            V@4-bit. Uses Apple's native mx.quantized_matmul. Default: ``None``.
+        kv_group_size (int): Group size for mixed-precision quantization.
+            Default: ``64``.
     """
     # Debug logging: trace the decision path
     logger.info("=" * 60)
     logger.info("make_prompt_cache called")
     logger.info(
-        f"  turbo_kv_bits={turbo_kv_bits}, turbo_fp16_layers={turbo_fp16_layers}, turbo_v_bits={turbo_v_bits}"
+        f"  turbo_kv_bits={turbo_kv_bits}, turbo_fp16_layers={turbo_fp16_layers}, "
+        f"turbo_v_bits={turbo_v_bits}, kv_bits={kv_bits}, kv_group_size={kv_group_size}"
     )
     logger.info(f"  max_kv_size={max_kv_size}")
     logger.info(f"  model has make_cache: {hasattr(model, 'make_cache')}")
@@ -129,6 +137,55 @@ def make_prompt_cache(
                     "cache, not standard key/value tensors."
                 )
             break
+
+    if kv_bits is not None:
+        # Mixed-precision quantized KV cache: K@k_bits, V@v_bits
+        k_bits, v_bits = kv_bits
+        logger.info(
+            f"[KV-QUANT] Using mixed-precision quantized cache: "
+            f"K@{k_bits}-bit, V@{v_bits}-bit, group_size={kv_group_size}"
+        )
+        if hasattr(model, "make_cache"):
+            default_cache = model.make_cache()
+            from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+
+            quantized = []
+            for i, c in enumerate(default_cache):
+                if isinstance(c, (KVCache, RotatingKVCache)):
+                    quantized.append(
+                        MixedQuantKVCache(
+                            k_bits=k_bits, v_bits=v_bits,
+                            k_group_size=kv_group_size, v_group_size=kv_group_size,
+                        )
+                    )
+                else:
+                    # Non-standard cache (ArraysCache, SparseKVCache, etc.)
+                    # — keep as-is; MixedQuant is not applicable
+                    quantized.append(c)
+            _log_cache_stats(quantized, None, 0, None)
+            logger.info(
+                f"[KV-QUANT] make_prompt_cache (make_cache): "
+                f"{len(quantized)} caches, "
+                f"types={[type(c).__name__ for c in quantized]}"
+            )
+            return quantized
+
+        num_layers = len(model.layers)
+        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+
+        caches = [
+            MixedQuantKVCache(
+                k_bits=k_bits, v_bits=v_bits,
+                k_group_size=kv_group_size, v_group_size=kv_group_size,
+            )
+            for _ in range(num_layers)
+        ]
+        _log_cache_stats(caches, None, 0, None)
+        logger.info(
+            f"[KV-QUANT] make_prompt_cache RETURNED: {len(caches)} caches, "
+            f"types={[type(c).__name__ for c in caches]}"
+        )
+        return caches
 
     if hasattr(model, "make_cache"):
         default_cache = model.make_cache()

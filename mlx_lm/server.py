@@ -471,11 +471,36 @@ class ResponseGenerator:
             model_provider.cli_args, "turbo_fp16_layers", 1
         )
         self._turbo_v_bits = getattr(model_provider.cli_args, "turbo_v_bits", None)
+        self._kv_bits = None
+        self._kv_group_size = 64
+        self._quantized_kv_start = 5000
+        self._kv_quantize_after_prefill = False
+        kv_quant_str = getattr(model_provider.cli_args, "kv_cache_quantization", None)
+        if kv_quant_str is not None:
+            parts = kv_quant_str.split(",")
+            if len(parts) == 2:
+                try:
+                    self._kv_bits = (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    logging.warning(
+                        f"[KV-QUANT] Invalid --kv-cache-quantization: {kv_quant_str}, "
+                        "expected K,V (e.g. 8,4)"
+                    )
+        self._kv_group_size = getattr(
+            model_provider.cli_args, "kv_group_size", 64
+        )
+        self._quantized_kv_start = getattr(
+            model_provider.cli_args, "quantized_kv_start", 5000
+        )
+        self._kv_quantize_after_prefill = getattr(
+            model_provider.cli_args, "kv_quantize_after_prefill", False
+        )
         logging.info(
-            f"[TURBO] ResponseGenerator initialized: "
-            f"turbo_kv_bits={self._turbo_kv_bits} (type={type(self._turbo_kv_bits).__name__}), "
-            f"turbo_fp16_layers={self._turbo_fp16_layers}, "
-            f"turbo_v_bits={self._turbo_v_bits}"
+            f"[KV-QUANT] ResponseGenerator initialized: "
+            f"kv_bits={self._kv_bits}, kv_group_size={self._kv_group_size}, "
+            f"quantized_kv_start={self._quantized_kv_start}, "
+            f"quantize_after_prefill={self._kv_quantize_after_prefill}, "
+            f"turbo_kv_bits={self._turbo_kv_bits}"
         )
         logging.info(
             f"[TURBO] model_provider.cli_args type={type(model_provider.cli_args).__name__}, "
@@ -902,6 +927,8 @@ class ResponseGenerator:
                         turbo_kv_bits=self._turbo_kv_bits,
                         turbo_fp16_layers=self._turbo_fp16_layers,
                         turbo_v_bits=self._turbo_v_bits,
+                        kv_bits=self._kv_bits,
+                        kv_group_size=self._kv_group_size,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -1047,20 +1074,41 @@ class ResponseGenerator:
             cache_key = prompt[:]
             if cache is None:
                 logging.info(
-                    f"[TURBO] CALL SITE: self._turbo_kv_bits={self._turbo_kv_bits} "
-                    f"(type={type(self._turbo_kv_bits).__name__}), "
-                    f"self._turbo_fp16_layers={self._turbo_fp16_layers}, "
-                    f"self._turbo_v_bits={self._turbo_v_bits}"
+                    f"[KV-QUANT] CALL SITE: kv_bits={self._kv_bits}, "
+                    f"kv_group_size={self._kv_group_size}, "
+                    f"quantized_kv_start={self._quantized_kv_start}, "
+                    f"quantize_after_prefill={self._kv_quantize_after_prefill}, "
+                    f"turbo_kv_bits={self._turbo_kv_bits}"
                 )
-                cache = make_prompt_cache(
-                    self.model_provider.model,
-                    turbo_kv_bits=self._turbo_kv_bits,
-                    turbo_fp16_layers=self._turbo_fp16_layers,
-                    turbo_v_bits=self._turbo_v_bits,
-                )
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
-                self._log_kv_cache_info(cache)
+                if self._kv_bits is not None and self._kv_quantize_after_prefill:
+                    # Upstream approach: FP16 prefill, then convert to mixed-quant
+                    logging.info(
+                        f"[KV-QUANT] Creating FP16 cache for prefill, "
+                        f"will convert to K@{self._kv_bits[0]},V@{self._kv_bits[1]} "
+                        f"after prefill"
+                    )
+                    cache = make_prompt_cache(
+                        self.model_provider.model,
+                        turbo_kv_bits=self._turbo_kv_bits,
+                        turbo_fp16_layers=self._turbo_fp16_layers,
+                        turbo_v_bits=self._turbo_v_bits,
+                    )
+                    if self.model_provider.draft_model is not None:
+                        cache += make_prompt_cache(self.model_provider.draft_model)
+                    self._log_kv_cache_info(cache)
+                else:
+                    # My approach: quantized from start
+                    cache = make_prompt_cache(
+                        self.model_provider.model,
+                        turbo_kv_bits=self._turbo_kv_bits,
+                        turbo_fp16_layers=self._turbo_fp16_layers,
+                        turbo_v_bits=self._turbo_v_bits,
+                        kv_bits=self._kv_bits,
+                        kv_group_size=self._kv_group_size,
+                    )
+                    if self.model_provider.draft_model is not None:
+                        cache += make_prompt_cache(self.model_provider.draft_model)
+                    self._log_kv_cache_info(cache)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1075,6 +1123,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self._kv_bits,
+                kv_group_size=self._kv_group_size,
+                quantized_kv_start=self._quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1994,6 +2045,37 @@ def main():
         default=None,
         help="Use standard affine quantization for values at the given "
         "bit width (e.g. 4) instead of PolarQuant. Requires --turbo-kv-bits.",
+    )
+    parser.add_argument(
+        "--kv-cache-quantization",
+        type=str,
+        default=None,
+        help="Mixed-precision KV cache quantization: K@K-bit,V@V-bit "
+        "(e.g. 8,4). Uses Apple's native mx.quantized_matmul. "
+        "Recommended over TurboQuant for stability.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64).",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=5000,
+        help="When --kv-cache-quantization is set, start quantizing the KV "
+        "cache from this token count onwards (post-prefill conversion). "
+        "Default: 5000.",
+    )
+    parser.add_argument(
+        "--kv-cache-quantize-after-prefill",
+        action="store_true",
+        default=False,
+        help="When --kv-cache-quantization is set, keep KV cache in FP16 "
+        "during prefill and convert to mixed-precision after prefill completes. "
+        "This gives better prefill quality but uses more memory during prefill. "
+        "Default: quantize from the start (lower memory, slightly lower prefill quality).",
     )
     parser.add_argument(
         "--max-resident-experts",

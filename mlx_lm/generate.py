@@ -416,7 +416,8 @@ def generate_step(
     # Create the KV cache for generation
     if prompt_cache is None:
         logging.info(
-            f"[TURBO] stream_generate (single) CALL SITE: "
+            f"[KV-QUANT] stream_generate (single) CALL SITE: "
+            f"kv_bits={kv_bits}, kv_group_size={kv_group_size}, "
             f"turbo_kv_bits={turbo_kv_bits}, turbo_fp16_layers={turbo_fp16_layers}, "
             f"turbo_v_bits={turbo_v_bits}"
         )
@@ -426,6 +427,8 @@ def generate_step(
             turbo_kv_bits=turbo_kv_bits,
             turbo_fp16_layers=turbo_fp16_layers,
             turbo_v_bits=turbo_v_bits,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -575,11 +578,15 @@ def speculative_generate_step(
     # Create the KV cache for generation
     if prompt_cache is None:
         logging.info(
-            f"[TURBO] stream_generate (speculative) CALL SITE: "
-            f"no turbo params passed (speculative decoding path)"
+            f"[KV-QUANT] stream_generate (speculative) CALL SITE: "
+            f"kv_bits={kv_bits}, kv_group_size={kv_group_size}"
         )
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+        model_cache = cache.make_prompt_cache(
+            model, kv_bits=kv_bits, kv_group_size=kv_group_size
+        )
+        draft_cache = cache.make_prompt_cache(
+            draft_model, kv_bits=kv_bits, kv_group_size=kv_group_size
+        )
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
@@ -1579,6 +1586,8 @@ class BatchGenerator:
         turbo_kv_bits: Optional[int] = None,
         turbo_fp16_layers: int = 1,
         turbo_v_bits: Optional[int] = None,
+        kv_bits: Optional[tuple[int, int]] = None,
+        kv_group_size: int = 64,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1592,6 +1601,8 @@ class BatchGenerator:
         self.turbo_kv_bits = turbo_kv_bits
         self.turbo_fp16_layers = turbo_fp16_layers
         self.turbo_v_bits = turbo_v_bits
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
 
         self._stream = stream or generation_stream
 
@@ -1730,7 +1741,8 @@ class BatchGenerator:
     def _make_new_cache(self):
         if self.max_kv_size is None:
             logging.info(
-                f"[TURBO] BatchGenerator._make_new_cache (batch) CALL SITE: "
+                f"[KV-QUANT] BatchGenerator._make_new_cache (batch) CALL SITE: "
+                f"kv_bits={self.kv_bits}, kv_group_size={self.kv_group_size}, "
                 f"turbo_kv_bits={self.turbo_kv_bits}, "
                 f"turbo_fp16_layers={self.turbo_fp16_layers}, "
                 f"turbo_v_bits={self.turbo_v_bits}"
@@ -1740,6 +1752,8 @@ class BatchGenerator:
                 turbo_kv_bits=self.turbo_kv_bits,
                 turbo_fp16_layers=self.turbo_fp16_layers,
                 turbo_v_bits=self.turbo_v_bits,
+                kv_bits=self.kv_bits,
+                kv_group_size=self.kv_group_size,
             )
 
         logging.info(
