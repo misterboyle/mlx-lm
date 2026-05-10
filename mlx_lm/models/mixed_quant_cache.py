@@ -426,3 +426,26 @@ class BatchMixedQuantKVCache:
                 N, offset=self._idx, window_size=window_size
             )
         return "causal"
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchMixedQuantKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            from .cache import dynamic_roll
+            padding = self._right_padding
+            self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
+            self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
