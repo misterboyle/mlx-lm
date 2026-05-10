@@ -238,6 +238,12 @@ class BatchMixedQuantKVCache:
         # Quantized value storage: tuple of 3 arrays (data, scales, biases)
         self.values: Optional[tuple] = None
 
+        # Dimension metadata (set from first cache in merge or first update)
+        self._k_data_dim = None
+        self._k_scale_dim = None
+        self._v_data_dim = None
+        self._v_scale_dim = None
+
     @classmethod
     def merge(cls, caches):
         """Create a BatchMixedQuantKVCache from per-sequence caches."""
@@ -268,6 +274,12 @@ class BatchMixedQuantKVCache:
         k_group_size = first.k_group_size
         v_group_size = first.v_group_size
 
+        # Get dimensions from first cache (like BatchTurboQuantKVCache does)
+        k_data_dim = first.keys[0].shape[-1]
+        k_scale_dim = first.keys[1].shape[-1]
+        v_data_dim = first.values[0].shape[-1]
+        v_scale_dim = first.values[1].shape[-1]
+
         # Allocate batched storage
         cache = cls(
             padding,
@@ -276,20 +288,24 @@ class BatchMixedQuantKVCache:
             k_group_size=k_group_size,
             v_group_size=v_group_size,
         )
+        cache._k_data_dim = k_data_dim
+        cache._k_scale_dim = k_scale_dim
+        cache._v_data_dim = v_data_dim
+        cache._v_scale_dim = v_scale_dim
 
         if max_length > 0:
             # Get KV head count from first cache
             n_kv_heads = first.keys[0].shape[1]
             # Initialize with zeros
             cache.keys = (
-                mx.zeros((B, n_kv_heads, max_length, first.keys[0].shape[-1]), dtype=first.keys[0].dtype),
-                mx.zeros((B, n_kv_heads, max_length, first.keys[1].shape[-1]), dtype=first.keys[1].dtype),
-                mx.zeros((B, n_kv_heads, max_length, first.keys[2].shape[-1]), dtype=first.keys[2].dtype),
+                mx.zeros((B, n_kv_heads, max_length, k_data_dim), dtype=first.keys[0].dtype),
+                mx.zeros((B, n_kv_heads, max_length, k_scale_dim), dtype=first.keys[1].dtype),
+                mx.zeros((B, n_kv_heads, max_length, k_scale_dim), dtype=first.keys[2].dtype),
             )
             cache.values = (
-                mx.zeros((B, n_kv_heads, max_length, first.values[0].shape[-1]), dtype=first.values[0].dtype),
-                mx.zeros((B, n_kv_heads, max_length, first.values[1].shape[-1]), dtype=first.values[1].dtype),
-                mx.zeros((B, n_kv_heads, max_length, first.values[2].shape[-1]), dtype=first.values[2].dtype),
+                mx.zeros((B, n_kv_heads, max_length, v_data_dim), dtype=first.values[0].dtype),
+                mx.zeros((B, n_kv_heads, max_length, v_scale_dim), dtype=first.values[1].dtype),
+                mx.zeros((B, n_kv_heads, max_length, v_scale_dim), dtype=first.values[2].dtype),
             )
 
             # Copy data from each sequence
@@ -307,7 +323,7 @@ class BatchMixedQuantKVCache:
         cache._idx = max_length
         return cache
 
-    def _ensure_storage(self, B, n_kv_heads, num_new):
+    def _ensure_storage(self, B, n_kv_heads, num_new, k_data_dim, k_scale_dim, v_data_dim, v_scale_dim):
         prev = self._idx
         needed = prev + num_new
         if self.keys is None or needed > self.keys[0].shape[2]:
@@ -331,16 +347,16 @@ class BatchMixedQuantKVCache:
                 new_v2[..., :prev, :] = self.values[2][..., :prev, :]
                 self.values = (new_v0, new_v1, new_v2)
             else:
-                # Initialize with zeros
+                # Initialize with zeros using actual dimensions
                 self.keys = (
-                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.uint32),
-                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
-                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
+                    mx.zeros((B, n_kv_heads, n, k_data_dim), dtype=mx.uint32),
+                    mx.zeros((B, n_kv_heads, n, k_scale_dim), dtype=mx.float16),
+                    mx.zeros((B, n_kv_heads, n, k_scale_dim), dtype=mx.float16),
                 )
                 self.values = (
-                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.uint32),
-                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
-                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
+                    mx.zeros((B, n_kv_heads, n, v_data_dim), dtype=mx.uint32),
+                    mx.zeros((B, n_kv_heads, n, v_scale_dim), dtype=mx.float16),
+                    mx.zeros((B, n_kv_heads, n, v_scale_dim), dtype=mx.float16),
                 )
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
@@ -348,7 +364,15 @@ class BatchMixedQuantKVCache:
         B, H, S, k_dim = keys.shape
         v_dim = values.shape[3]
 
-        self._ensure_storage(B, H, S)
+        # Compute quantized dimensions (same as _init_quant)
+        k_el_per_int = 8 * mx.uint32.size // self.k_bits
+        v_el_per_int = 8 * mx.uint32.size // self.v_bits
+        k_data_dim = k_dim // k_el_per_int
+        k_scale_dim = k_dim // self.k_group_size
+        v_data_dim = v_dim // v_el_per_int
+        v_scale_dim = v_dim // self.v_group_size
+
+        self._ensure_storage(B, H, S, k_data_dim, k_scale_dim, v_data_dim, v_scale_dim)
 
         # Quantize + write (batched)
         k_q = mx.quantize(keys, group_size=self.k_group_size, bits=self.k_bits)
