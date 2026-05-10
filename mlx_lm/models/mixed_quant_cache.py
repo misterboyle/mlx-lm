@@ -391,16 +391,12 @@ class BatchMixedQuantKVCache:
         self._idx += S
         total = self._idx
 
-        # Dequantize and return
-        k_fp = mx.dequantize(
-            *[x[..., :total, :] for x in self.keys],
-            group_size=self.k_group_size, bits=self.k_bits,
+        # Return quantized views (not dequantized) — matches MixedQuantKVCache interface
+        off = self._idx
+        return (
+            (self.keys[0][..., :off, :], self.keys[1][..., :off, :], self.keys[2][..., :off, :]),
+            (self.values[0][..., :off, :], self.values[1][..., :off, :], self.values[2][..., :off, :]),
         )
-        v_fp = mx.dequantize(
-            *[x[..., :total, :] for x in self.values],
-            group_size=self.v_group_size, bits=self.v_bits,
-        )
-        return k_fp, v_fp
 
     def empty(self):
         return self.keys is None
