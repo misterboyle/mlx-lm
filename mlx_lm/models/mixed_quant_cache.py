@@ -43,8 +43,14 @@ class MixedQuantKVCache:
             obj.offset = cache.offset
             k_slice = cache.keys[..., :cache.offset, :]
             v_slice = cache.values[..., :cache.offset, :]
-            obj.keys = mx.quantize(k_slice, group_size=k_group_size, bits=k_bits)
-            obj.values = mx.quantize(v_slice, group_size=v_group_size, bits=v_bits)
+            # Only quantize if the cache is still FP16 (not already quantized)
+            if k_slice.dtype == mx.uint32:
+                # Already quantized — copy as-is
+                obj.keys = cache.keys
+                obj.values = cache.values
+            else:
+                obj.keys = mx.quantize(k_slice, group_size=k_group_size, bits=k_bits)
+                obj.values = mx.quantize(v_slice, group_size=v_group_size, bits=v_bits)
         return obj
 
     def _init_quant(self, B, n_kv_heads, n_steps, dim, group_size, bits, dtype):
