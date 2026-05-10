@@ -467,3 +467,78 @@ class BatchMixedQuantKVCache:
         self.keys = (v[0], v[1], v[2])
         self.values = (v[3], v[4], v[5])
         self._idx = self.keys[0].shape[2]
+
+    def filter(self, batch_indices):
+        """In-place filter to keep just the given indices in the cache."""
+        if self.keys is not None:
+            self.keys = tuple(x[batch_indices] for x in self.keys)
+            self.values = tuple(x[batch_indices] for x in self.values)
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        # Shift left to reduce padding
+        min_left_pad = self.left_padding.min().item()
+        if min_left_pad > 0:
+            if self.keys is not None:
+                self.keys = tuple(x[..., min_left_pad:, :] for x in self.keys)
+                self.values = tuple(x[..., min_left_pad:, :] for x in self.values)
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def extract(self, idx):
+        """Extract a single sequence from the batched cache."""
+        from .cache import KVCache
+
+        kv = KVCache()
+        padding = self.left_padding[idx].item()
+        kv.keys = mx.contiguous(self.keys[0][idx : idx + 1, :, padding : self._idx])
+        kv.values = mx.contiguous(self.values[0][idx : idx + 1, :, padding : self._idx])
+        kv.offset = kv.keys.shape[2]
+        return kv
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def extend(self, other):
+        """In-place extend this cache with the other cache."""
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys[0].shape
+            M = self.values[0].shape[3]
+        if other.keys is not None:
+            B, H, L2, D = other.keys[0].shape
+            M = other.values[0].shape[3]
+        max_size = max(L1, L2)
+
+        def pad(c):
+            k, v = c.keys, c.values
+            if k is None:
+                Bc = c.offset.shape[0]
+                k = tuple(mx.array([]).reshape(Bc, H, 0, D) for _ in k)
+                v = tuple(mx.array([]).reshape(Bc, H, 0, M) for _ in v)
+            left = max_idx - c._idx
+            right = max_size - k[0].shape[2] - left
+            if right < 0:
+                k = tuple(x[..., :right, :] for x in k)
+                v = tuple(x[..., :right, :] for x in v)
+                right = 0
+            if left != 0 or right != 0:
+                pad_dims = [(0, 0), (0, 0), (left, right), (0, 0)]
+                k = tuple(mx.pad(x, pad_dims) for x in k)
+                v = tuple(mx.pad(x, pad_dims) for x in v)
+            left_padding = c.left_padding + left
+            return k, v, c.offset, left_padding
+
+        self.keys, self.values, self.offset, self.left_padding = map(
+            mx.concatenate, zip(*(pad(self), pad(other)))
+        )
+        self._idx = max_idx
