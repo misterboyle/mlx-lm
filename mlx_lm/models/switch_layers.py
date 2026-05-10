@@ -273,13 +273,13 @@ class SwitchGLU(nn.Module):
             return self._decode_sequential_offloaded(x, flat_idx, n)
 
         # Fused gate+up+SwiGLU: one Metal dispatch for all experts
-        if g.bits == 4:
+        if g.bits in (4, 8):
             from .fused_moe_kernel import fused_gate_up_swiglu
             h = fused_gate_up_swiglu(
                 x.reshape(-1), g, self.up_proj,
                 flat_idx.astype(mx.uint32))  # [n, hidden]
         else:
-            # Fallback for non-4-bit
+            # Fallback for unsupported bit widths
             u = self.up_proj
             x_2d = x.reshape(1, -1)
             hs = []
@@ -293,7 +293,7 @@ class SwitchGLU(nn.Module):
             h = mx.stack(hs)
 
         # Down proj: fused Metal kernel (all experts, one dispatch)
-        if d.bits == 4:
+        if d.bits in (4, 8):
             from .fused_moe_kernel import fused_down_proj
             result = fused_down_proj(h, d, flat_idx.astype(mx.uint32))
         else:
