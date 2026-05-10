@@ -229,16 +229,15 @@ class SwitchGLU(nn.Module):
         idx_flat = indices.reshape(-1, top_k)    # (T, K)
         T = x_flat.shape[0]
 
-        # Collect all unique expert ids needed
-        all_expert_ids = idx_flat.reshape(-1).tolist()
-        offloader.ensure_resident(all_expert_ids)
-
         results = []
         for t in range(T):
             token_x = x_flat[t:t+1]  # (1, H)
+            # Ensure this token's experts are resident
+            token_experts = [idx_flat[t, k].item() for k in range(top_k)]
+            offloader.ensure_resident(token_experts)
             expert_outs = []
             for k in range(top_k):
-                eid = idx_flat[t, k].item()
+                eid = token_experts[k]
                 ew = offloader.get_expert_weights(eid)
                 gi = mx.quantized_matmul(
                     token_x, ew.gate_w, ew.gate_s, ew.gate_b,
