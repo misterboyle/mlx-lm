@@ -332,11 +332,38 @@ class GenerationResponse:
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+    """Convert KVCache to quantized cache after prefill.
+
+    Supports two modes:
+    - Uniform quantization: kv_bits is an int (e.g. 8) → QuantizedKVCache
+    - Mixed quantization: kv_bits is a tuple (e.g. (8, 4)) → MixedQuantKVCache
+      with K@k_bits, V@v_bits. Uses from_kvcache for post-prefill conversion.
+    """
     if kv_bits is None:
         return
-    for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+
+    # MixedQuant path: kv_bits is a tuple (k_bits, v_bits)
+    if isinstance(kv_bits, tuple):
+        k_bits, v_bits = kv_bits
+        from mlx_lm.models.cache import KVCache
+        from mlx_lm.models.mixed_quant_cache import MixedQuantKVCache
+
+        for e, c in enumerate(prompt_cache):
+            if isinstance(c, KVCache) and c.offset >= quantized_kv_start:
+                prompt_cache[e] = MixedQuantKVCache.from_kvcache(
+                    c,
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    k_group_size=kv_group_size,
+                    v_group_size=kv_group_size,
+                )
+    else:
+        # Uniform quantization path
+        for e, c in enumerate(prompt_cache):
+            if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+                prompt_cache[e] = c.to_quantized(
+                    group_size=kv_group_size, bits=kv_bits
+                )
 
 
 def generate_step(

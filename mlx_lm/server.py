@@ -46,6 +46,44 @@ from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
 
+def _maybe_dequantize_cache(cache):
+    """Convert MixedQuantKVCache entries back to KVCache for batch merge."""
+    from .models.mixed_quant_cache import MixedQuantKVCache
+
+    for i, c in enumerate(cache):
+        if isinstance(c, MixedQuantKVCache):
+            cache[i] = c.to_kvcache()
+    return cache
+
+
+def _maybe_quantize_cache(cache, kv_quant_config, min_tokens=0):
+    """Convert a list of KVCache to MixedQuantKVCache for LRU storage.
+
+    Args:
+        cache: list of cache objects (KVCache, QuantizedKVCache, etc.)
+        kv_quant_config: (k_bits, v_bits) tuple, or None to skip.
+        min_tokens: only quantize caches with at least this many tokens.
+
+    Returns:
+        The cache list, with eligible KVCache entries converted in-place.
+    """
+    if kv_quant_config is None:
+        return cache
+    k_bits, v_bits = kv_quant_config
+    from .models.cache import KVCache
+    from .models.mixed_quant_cache import MixedQuantKVCache
+
+    for i, c in enumerate(cache):
+        # Skip entries that are already quantized (re-stored after batch extract)
+        if isinstance(c, MixedQuantKVCache):
+            continue
+        if isinstance(c, KVCache) and c.offset >= max(min_tokens, 1):
+            cache[i] = MixedQuantKVCache.from_kvcache(
+                c, k_bits=k_bits, v_bits=v_bits
+            )
+    return cache
+
+
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
@@ -569,6 +607,19 @@ class ResponseGenerator:
         )
         logging.info("=" * 60)
 
+    def _store_cache(self, model_key, cache_key, cache, **kwargs):
+        """Optionally quantize KV cache before inserting into LRU.
+
+        When --kv-quantize-after-prefill is set, the cache is FP16 during
+        generation and gets quantized here before LRU storage.
+        When not set (quantized from start), the cache is already quantized
+        and this is a no-op.
+        """
+        cache = _maybe_quantize_cache(
+            cache, self._kv_bits, min_tokens=self._quantized_kv_start
+        )
+        self.prompt_cache.insert_cache(model_key, cache_key, cache, **kwargs)
+
     def _next_request(self, timeout=None):
         request = None
         if not self._is_distributed or self._rank == 0:
@@ -976,7 +1027,7 @@ class ResponseGenerator:
                     ]
                     caches = batch_generator.extract_cache(eos_ids)
                     for uid, (cache, cache_key) in caches.items():
-                        self.prompt_cache.insert_cache(
+                        self._store_cache(
                             self.model_provider.model_key,
                             cache_key[:],
                             cache,
@@ -1005,7 +1056,7 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
+                            self._store_cache(
                                 current_model_key,
                                 r.all_tokens[:],
                                 r.prompt_cache,
@@ -1156,8 +1207,8 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
+            # Save the KV cache (optionally quantized before LRU storage)
+            self._store_cache(
                 self.model_provider.model_key, cache_key, cache
             )
 

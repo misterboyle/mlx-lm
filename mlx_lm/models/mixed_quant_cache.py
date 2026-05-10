@@ -204,3 +204,203 @@ class MixedQuantKVCache:
 
     def size(self):
         return self.offset
+
+    @classmethod
+    def merge(cls, caches):
+        """Create a BatchMixedQuantKVCache from per-sequence caches."""
+        from .mixed_quant_cache import BatchMixedQuantKVCache
+        return BatchMixedQuantKVCache.merge(caches)
+
+
+class BatchMixedQuantKVCache:
+    """Batched MixedQuantKVCache for continuous batching with history.
+
+    Similar to BatchKVCache but stores quantized K/V tuples instead of
+    dense keys/values. Each batch element is left-padded so that token i
+    of sequence b appears at position (left_padding[b] + i) in the
+    batched buffer.
+    """
+
+    step = 256
+
+    def __init__(self, left_padding, k_bits=8, v_bits=4, k_group_size=64, v_group_size=64):
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-lp for lp in left_padding])
+        self._idx = 0
+        self.k_bits = k_bits
+        self.v_bits = v_bits
+        self.k_group_size = k_group_size
+        self.v_group_size = v_group_size
+        self._right_padding = None
+
+        # Quantized key storage: tuple of 3 arrays (data, scales, biases)
+        self.keys: Optional[tuple] = None
+        # Quantized value storage: tuple of 3 arrays (data, scales, biases)
+        self.values: Optional[tuple] = None
+
+    @classmethod
+    def merge(cls, caches):
+        """Create a BatchMixedQuantKVCache from per-sequence caches."""
+        if not caches:
+            return cls([0], k_bits=8, v_bits=4)
+
+        # Extract metadata from first non-empty cache
+        first = next((c for c in caches if not c.empty()), None)
+        if first is None:
+            # All empty — return single batch cache with zero padding
+            B = len(caches)
+            return cls(
+                [0] * B,
+                k_bits=caches[0].k_bits,
+                v_bits=caches[0].v_bits,
+                k_group_size=caches[0].k_group_size,
+                v_group_size=caches[0].v_group_size,
+            )
+
+        B = len(caches)
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths)
+        padding = [max_length - l for l in lengths]
+
+        # Get quantization params from first cache
+        k_bits = first.k_bits
+        v_bits = first.v_bits
+        k_group_size = first.k_group_size
+        v_group_size = first.v_group_size
+
+        # Allocate batched storage
+        cache = cls(
+            padding,
+            k_bits=k_bits,
+            v_bits=v_bits,
+            k_group_size=k_group_size,
+            v_group_size=v_group_size,
+        )
+
+        if max_length > 0:
+            # Initialize with zeros
+            cache.keys = (
+                mx.zeros((B, 1, max_length, first.keys[0].shape[-1]), dtype=first.keys[0].dtype),
+                mx.zeros((B, 1, max_length, first.keys[1].shape[-1]), dtype=first.keys[1].dtype),
+                mx.zeros((B, 1, max_length, first.keys[2].shape[-1]), dtype=first.keys[2].dtype),
+            )
+            cache.values = (
+                mx.zeros((B, 1, max_length, first.values[0].shape[-1]), dtype=first.values[0].dtype),
+                mx.zeros((B, 1, max_length, first.values[1].shape[-1]), dtype=first.values[1].dtype),
+                mx.zeros((B, 1, max_length, first.values[2].shape[-1]), dtype=first.values[2].dtype),
+            )
+
+            # Copy data from each sequence
+            for i, (p, c) in enumerate(zip(padding, caches)):
+                if c.empty():
+                    continue
+                total = c.size()
+                cache.keys[0][i : i + 1, :, p : p + total, :] = c.keys[0][..., :total, :]
+                cache.keys[1][i : i + 1, :, p : p + total, :] = c.keys[1][..., :total, :]
+                cache.keys[2][i : i + 1, :, p : p + total, :] = c.keys[2][..., :total, :]
+                cache.values[0][i : i + 1, :, p : p + total, :] = c.values[0][..., :total, :]
+                cache.values[1][i : i + 1, :, p : p + total, :] = c.values[1][..., :total, :]
+                cache.values[2][i : i + 1, :, p : p + total, :] = c.values[2][..., :total, :]
+
+        cache._idx = max_length
+        return cache
+
+    def _ensure_storage(self, B, n_kv_heads, num_new):
+        prev = self._idx
+        needed = prev + num_new
+        if self.keys is None or needed > self.keys[0].shape[2]:
+            n = ((needed + self.step - 1) // self.step) * self.step
+            if self.keys is not None:
+                # Expand K storage
+                new_k0 = mx.zeros((B, n_kv_heads, n, self.keys[0].shape[-1]), dtype=self.keys[0].dtype)
+                new_k1 = mx.zeros((B, n_kv_heads, n, self.keys[1].shape[-1]), dtype=self.keys[1].dtype)
+                new_k2 = mx.zeros((B, n_kv_heads, n, self.keys[2].shape[-1]), dtype=self.keys[2].dtype)
+                new_k0[..., :prev, :] = self.keys[0][..., :prev, :]
+                new_k1[..., :prev, :] = self.keys[1][..., :prev, :]
+                new_k2[..., :prev, :] = self.keys[2][..., :prev, :]
+                self.keys = (new_k0, new_k1, new_k2)
+
+                # Expand V storage
+                new_v0 = mx.zeros((B, n_kv_heads, n, self.values[0].shape[-1]), dtype=self.values[0].dtype)
+                new_v1 = mx.zeros((B, n_kv_heads, n, self.values[1].shape[-1]), dtype=self.values[1].dtype)
+                new_v2 = mx.zeros((B, n_kv_heads, n, self.values[2].shape[-1]), dtype=self.values[2].dtype)
+                new_v0[..., :prev, :] = self.values[0][..., :prev, :]
+                new_v1[..., :prev, :] = self.values[1][..., :prev, :]
+                new_v2[..., :prev, :] = self.values[2][..., :prev, :]
+                self.values = (new_v0, new_v1, new_v2)
+            else:
+                # Initialize with zeros
+                self.keys = (
+                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.uint32),
+                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
+                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
+                )
+                self.values = (
+                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.uint32),
+                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
+                    mx.zeros((B, n_kv_heads, n, 1), dtype=mx.float16),
+                )
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        """Update with batched keys/values. keys/values shape: (B, H, S, D)."""
+        B, H, S, k_dim = keys.shape
+        v_dim = values.shape[3]
+
+        self._ensure_storage(B, H, S)
+
+        # Quantize + write (batched)
+        k_q = mx.quantize(keys, group_size=self.k_group_size, bits=self.k_bits)
+        v_q = mx.quantize(values, group_size=self.v_group_size, bits=self.v_bits)
+
+        # Write to batched buffer with left-padding
+        for i in range(B):
+            p = self.left_padding[i].item()
+            self.keys[0][i : i + 1, :, p : p + S, :] = k_q[0][i : i + 1]
+            self.keys[1][i : i + 1, :, p : p + S, :] = k_q[1][i : i + 1]
+            self.keys[2][i : i + 1, :, p : p + S, :] = k_q[2][i : i + 1]
+            self.values[0][i : i + 1, :, p : p + S, :] = v_q[0][i : i + 1]
+            self.values[1][i : i + 1, :, p : p + S, :] = v_q[1][i : i + 1]
+            self.values[2][i : i + 1, :, p : p + S, :] = v_q[2][i : i + 1]
+
+        self._idx += S
+        total = self._idx
+
+        # Dequantize and return
+        k_fp = mx.dequantize(
+            *[x[..., :total, :] for x in self.keys],
+            group_size=self.k_group_size, bits=self.k_bits,
+        )
+        v_fp = mx.dequantize(
+            *[x[..., :total, :] for x in self.values],
+            group_size=self.v_group_size, bits=self.v_bits,
+        )
+        return k_fp, v_fp
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        total = 0
+        for arrays in (self.keys, self.values):
+            for x in arrays:
+                total += x[..., : self._idx, :].nbytes
+        return total
+
+    def size(self):
+        return self._idx
+
+    def is_trimmable(self):
+        return False
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        from .base import create_causal_mask
+        if N == 1:
+            return None
+        if return_array or (window_size is not None and N > window_size):
+            return create_causal_mask(
+                N, offset=self._idx, window_size=window_size
+            )
+        return "causal"
