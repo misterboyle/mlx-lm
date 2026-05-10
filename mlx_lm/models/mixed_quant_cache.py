@@ -278,16 +278,18 @@ class BatchMixedQuantKVCache:
         )
 
         if max_length > 0:
+            # Get KV head count from first cache
+            n_kv_heads = first.keys[0].shape[1]
             # Initialize with zeros
             cache.keys = (
-                mx.zeros((B, 1, max_length, first.keys[0].shape[-1]), dtype=first.keys[0].dtype),
-                mx.zeros((B, 1, max_length, first.keys[1].shape[-1]), dtype=first.keys[1].dtype),
-                mx.zeros((B, 1, max_length, first.keys[2].shape[-1]), dtype=first.keys[2].dtype),
+                mx.zeros((B, n_kv_heads, max_length, first.keys[0].shape[-1]), dtype=first.keys[0].dtype),
+                mx.zeros((B, n_kv_heads, max_length, first.keys[1].shape[-1]), dtype=first.keys[1].dtype),
+                mx.zeros((B, n_kv_heads, max_length, first.keys[2].shape[-1]), dtype=first.keys[2].dtype),
             )
             cache.values = (
-                mx.zeros((B, 1, max_length, first.values[0].shape[-1]), dtype=first.values[0].dtype),
-                mx.zeros((B, 1, max_length, first.values[1].shape[-1]), dtype=first.values[1].dtype),
-                mx.zeros((B, 1, max_length, first.values[2].shape[-1]), dtype=first.values[2].dtype),
+                mx.zeros((B, n_kv_heads, max_length, first.values[0].shape[-1]), dtype=first.values[0].dtype),
+                mx.zeros((B, n_kv_heads, max_length, first.values[1].shape[-1]), dtype=first.values[1].dtype),
+                mx.zeros((B, n_kv_heads, max_length, first.values[2].shape[-1]), dtype=first.values[2].dtype),
             )
 
             # Copy data from each sequence
