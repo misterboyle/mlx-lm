@@ -531,7 +531,7 @@ class ResponseGenerator:
             model_provider.cli_args, "quantized_kv_start", 5000
         )
         self._kv_quantize_after_prefill = getattr(
-            model_provider.cli_args, "kv_quantize_after_prefill", False
+            model_provider.cli_args, "kv_cache_quantize_after_prefill", False
         )
         logging.info(
             f"[KV-QUANT] ResponseGenerator initialized: "
