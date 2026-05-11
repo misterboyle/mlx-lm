@@ -548,6 +548,7 @@ class BatchTurboQuantKVCache:
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-lp for lp in left_padding])
         self._idx = 0
+        self._prefix_len = 0  # cumulative prefix tokens written
         self.quant_bits = bits
         self.seed = seed
         self.v_bits = v_bits
@@ -785,6 +786,8 @@ class BatchTurboQuantKVCache:
             prefix_values = values[..., :actual_prefix, :]
             self._k_prefix[..., self._idx : self._idx + actual_prefix, :] = prefix_keys
             self._v_prefix[..., self._idx : self._idx + actual_prefix, :] = prefix_values
+            # Track cumulative prefix length for replacement
+            self._prefix_len += actual_prefix
 
         # Quantize tokens beyond the prefix threshold
         if quant_len > 0:
@@ -847,9 +850,9 @@ class BatchTurboQuantKVCache:
             )
 
         # Replace quantized prefix tokens with raw fp16 values
-        if actual_prefix > 0:
-            all_k[..., :actual_prefix, :] = self._k_prefix[..., self._idx - actual_prefix : self._idx, :]
-            all_v[..., :actual_prefix, :] = self._v_prefix[..., self._idx - actual_prefix : self._idx, :]
+        if self._prefix_len > 0:
+            all_k[..., :self._prefix_len, :] = self._k_prefix[..., self._idx - self._prefix_len : self._idx, :]
+            all_v[..., :self._prefix_len, :] = self._v_prefix[..., self._idx - self._prefix_len : self._idx, :]
 
         return all_k, all_v
 
@@ -908,6 +911,7 @@ class BatchTurboQuantKVCache:
         if self._k_prefix is not None:
             state.append(self._k_prefix)
             state.append(self._v_prefix)
+            state.append(self._prefix_len)
         return state
 
     @state.setter
@@ -927,6 +931,8 @@ class BatchTurboQuantKVCache:
             if len(v) > 7:
                 self._k_prefix = v[7]
                 self._v_prefix = v[8]
+                if len(v) > 9:
+                    self._prefix_len = int(v[9])
         else:
             self.k_packed, self.k_norms, self.v_packed, self.v_norms = v[:4]
             self.left_padding, self.offset = v[4], v[5]
@@ -934,6 +940,8 @@ class BatchTurboQuantKVCache:
             if len(v) > 6:
                 self._k_prefix = v[6]
                 self._v_prefix = v[7]
+                if len(v) > 8:
+                    self._prefix_len = int(v[8])
         self._idx = self.k_packed.shape[2]
 
     @property
@@ -1035,6 +1043,8 @@ class BatchTurboQuantKVCache:
                     self.v_norms = self.v_norms[..., min_left_pad:]
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
+            # Prefix storage positions shifted — reset cumulative tracking
+            self._prefix_len = 0
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         """Prepare cache for right-padded prompt processing.
@@ -1276,6 +1286,7 @@ class BatchTurboQuantKVCache:
         obj.left_padding = None
         obj.offset = None
         obj._idx = 0
+        obj._prefix_len = 0
         obj.meta_state = meta_state
         obj.state = state
         return obj
