@@ -1028,6 +1028,7 @@ class BatchTurboQuantKVCache:
             self.offset = mx.array([], dtype=mx.int32)
             self.left_padding = mx.array([], dtype=mx.int32)
             self._idx = 0
+            self._prefix_len = 0
             return
 
         if self.k_packed is not None:
