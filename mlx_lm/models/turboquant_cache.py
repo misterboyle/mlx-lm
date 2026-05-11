@@ -74,11 +74,12 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, seed: int = 42, v_bits=None):
+    def __init__(self, bits: int = 3, seed: int = 42, v_bits=None, min_tokens_before_quant: int = 128):
         self.quant_bits = bits
         self.seed = seed
         self.v_bits = v_bits
         self.v_group_size = 64
+        self.min_tokens_before_quant = min_tokens_before_quant
         self.offset = 0
 
         self.k_packed = None
@@ -90,6 +91,10 @@ class TurboQuantKVCache:
         self._v_quant = None  # quantized uint32 data
         self._v_scales = None  # per-group scales
         self._v_biases = None  # per-group biases
+
+        # FP16 prefix storage for attention sinks (tokens before min_tokens_before_quant)
+        self._k_prefix = None  # raw fp16 keys for prefix tokens
+        self._v_prefix = None  # raw fp16 values for prefix tokens
 
         self._k_deq_buf = None
         self._v_deq_buf = None
@@ -195,109 +200,102 @@ class TurboQuantKVCache:
         self._ensure_storage(B, H, S)
         prev = self.offset
 
-        # Fused Metal quantize for keys (PolarQuant)
-        k_pk, k_nrm = fused_quantize(
-            keys.reshape(-1, k_dim),
-            self._k_q.signs,
-            self._k_q.boundaries,
-            k_dim,
-            self.quant_bits,
-        )
-        k_pk = k_pk.reshape(B, H, S, self._k_pdim)
+        # Determine how many tokens are in the prefix (fp16) vs quantized region
+        prefix_end = self.min_tokens_before_quant
+        prefix_tokens = max(0, prefix_end - prev)
+        quant_tokens = S - prefix_tokens
+        actual_prefix = min(prefix_tokens, S)
 
-        self.k_packed[..., prev : prev + S, :] = k_pk
-        self.k_norms[..., prev : prev + S] = k_nrm.reshape(B, H, S)
+        # Store prefix tokens in fp16 (attention sinks)
+        if prefix_tokens > 0:
+            # Ensure prefix storage is allocated
+            if self._k_prefix is None:
+                alloc = ((prefix_end + self.step - 1) // self.step) * self.step
+                self._k_prefix = mx.zeros((B, H, alloc, k_dim), dtype=keys.dtype)
+                self._v_prefix = mx.zeros((B, H, alloc, v_dim), dtype=values.dtype)
+            # Copy only the actual prefix tokens (may be less than prefix_tokens if S < prefix_tokens)
+            self._k_prefix[..., prev : prev + actual_prefix, :] = keys[..., :actual_prefix, :]
+            self._v_prefix[..., prev : prev + actual_prefix, :] = values[..., :actual_prefix, :]
 
-        if self.v_bits is not None:
-            # Affine quantize values with mx.quantize
-            vq, vs, vb = mx.quantize(
-                values, group_size=self.v_group_size, bits=self.v_bits
-            )
-            self._v_quant[..., prev : prev + S, :] = vq
-            self._v_scales[..., prev : prev + S, :] = vs
-            self._v_biases[..., prev : prev + S, :] = vb
-        else:
-            # PolarQuant for values
-            v_pk, v_nrm = fused_quantize(
-                values.reshape(-1, v_dim),
-                self._v_q.signs,
-                self._v_q.boundaries,
-                v_dim,
+        # Quantize tokens beyond the prefix threshold
+        if quant_tokens > 0:
+            q_start = prefix_end
+            q_keys = keys[..., prefix_tokens:, :] if prefix_tokens > 0 else keys
+            q_values = values[..., prefix_tokens:, :] if prefix_tokens > 0 else values
+            q_S = quant_tokens
+
+            # Fused Metal quantize for keys (PolarQuant)
+            k_pk, k_nrm = fused_quantize(
+                q_keys.reshape(-1, k_dim),
+                self._k_q.signs,
+                self._k_q.boundaries,
+                k_dim,
                 self.quant_bits,
             )
-            v_pk = v_pk.reshape(B, H, S, self._v_pdim)
-            self.v_packed[..., prev : prev + S, :] = v_pk
-            self.v_norms[..., prev : prev + S] = v_nrm.reshape(B, H, S)
+            k_pk = k_pk.reshape(B, H, q_S, self._k_pdim)
+
+            self.k_packed[..., q_start : q_start + q_S, :] = k_pk
+            self.k_norms[..., q_start : q_start + q_S] = k_nrm.reshape(B, H, q_S)
+
+            if self.v_bits is not None:
+                # Affine quantize values with mx.quantize
+                vq, vs, vb = mx.quantize(
+                    q_values, group_size=self.v_group_size, bits=self.v_bits
+                )
+                self._v_quant[..., q_start : q_start + q_S, :] = vq
+                self._v_scales[..., q_start : q_start + q_S, :] = vs
+                self._v_biases[..., q_start : q_start + q_S, :] = vb
+            else:
+                # PolarQuant for values
+                v_pk, v_nrm = fused_quantize(
+                    q_values.reshape(-1, v_dim),
+                    self._v_q.signs,
+                    self._v_q.boundaries,
+                    v_dim,
+                    self.quant_bits,
+                )
+                v_pk = v_pk.reshape(B, H, q_S, self._v_pdim)
+                self.v_packed[..., q_start : q_start + q_S, :] = v_pk
+                self.v_norms[..., q_start : q_start + q_S] = v_nrm.reshape(B, H, q_S)
 
         self.offset += S
         total = self.offset
 
-        # Incremental decode
-        if S <= 4 and self._v_deq_buf is not None and self._deq_offset == prev:
-            if total > self._deq_alloc:
-                na = ((total + self.step - 1) // self.step) * self.step
-                self._k_deq_buf = mx.concatenate(
-                    [
-                        self._k_deq_buf[..., : self._deq_offset, :],
-                        mx.zeros((B, H, na - self._deq_alloc, k_dim), dtype=keys.dtype),
-                    ],
-                    axis=2,
-                )
-                self._v_deq_buf = mx.concatenate(
-                    [
-                        self._v_deq_buf[..., : self._deq_offset, :],
-                        mx.zeros(
-                            (B, H, na - self._deq_alloc, v_dim), dtype=values.dtype
-                        ),
-                    ],
-                    axis=2,
-                )
-                self._deq_alloc = na
+        # Build dequantized output: prefix tokens from fp16 storage, rest from dequant
+        if self._k_deq_buf is None or total > self._deq_alloc:
+            alloc = ((total + self.step - 1) // self.step) * self.step
+            self._k_deq_buf = mx.zeros((B, H, alloc, k_dim), dtype=keys.dtype)
+            self._v_deq_buf = mx.zeros((B, H, alloc, v_dim), dtype=values.dtype)
+            self._deq_alloc = alloc
 
-            nk = dequant_fp16(
-                k_pk.reshape(-1, self._k_pdim),
-                k_nrm,
-                self._k_q.centroids,
-                self._k_q.signs,
-                k_dim,
-                self.quant_bits,
-            ).reshape(B, H, S, k_dim)
-            if self.v_bits is not None:
-                nv = mx.dequantize(
-                    vq, vs, vb, group_size=self.v_group_size, bits=self.v_bits
-                ).astype(values.dtype)
-            else:
-                nv = dequant_fp16(
-                    v_pk.reshape(-1, self._v_pdim),
-                    v_nrm,
-                    self._v_q.centroids,
-                    self._v_q.signs,
-                    v_dim,
-                    self.quant_bits,
-                ).reshape(B, H, S, v_dim)
-            self._k_deq_buf[..., prev:total, :] = nk
-            self._v_deq_buf[..., prev:total, :] = nv
-            self._deq_offset = total
-            return self._k_deq_buf[..., :total, :], self._v_deq_buf[..., :total, :]
+        # Copy prefix tokens from fp16 storage
+        if prefix_tokens > 0:
+            self._k_deq_buf[..., prev : prev + actual_prefix, :] = self._k_prefix[..., prev : prev + actual_prefix, :]
+            self._v_deq_buf[..., prev : prev + actual_prefix, :] = self._v_prefix[..., prev : prev + actual_prefix, :]
 
-        # Full dequant (prefill)
-        all_k = self._full_dequant(
-            self.k_packed, self.k_norms, self._k_q, k_dim, B, H, total, keys.dtype
-        )
-        if self.v_bits is not None:
-            all_v = self._dequantize_affine_values(B, H, total, values.dtype)
-        else:
-            all_v = self._full_dequant(
-                self.v_packed, self.v_norms, self._v_q, v_dim, B, H, total, values.dtype
+        # Dequant quantized tokens
+        if quant_tokens > 0:
+            q_start = prev + actual_prefix
+            all_k = self._full_dequant(
+                self.k_packed[..., q_start:total, :],
+                self.k_norms[..., q_start:total],
+                self._k_q, k_dim, B, H, quant_tokens, keys.dtype
             )
-        alloc = ((total + self.step - 1) // self.step) * self.step
-        self._k_deq_buf = mx.zeros((B, H, alloc, k_dim), dtype=keys.dtype)
-        self._v_deq_buf = mx.zeros((B, H, alloc, v_dim), dtype=values.dtype)
-        self._k_deq_buf[..., :total, :] = all_k
-        self._v_deq_buf[..., :total, :] = all_v
+            if self.v_bits is not None:
+                all_v = self._dequantize_affine_values(B, H, quant_tokens, values.dtype)
+                # Slice to only the quantized portion
+                all_v = all_v[..., :quant_tokens, :]
+            else:
+                all_v = self._full_dequant(
+                    self.v_packed[..., q_start:total, :],
+                    self.v_norms[..., q_start:total],
+                    self._v_q, v_dim, B, H, quant_tokens, values.dtype
+                )
+            self._k_deq_buf[..., q_start:total, :] = all_k
+            self._v_deq_buf[..., q_start:total, :] = all_v
+
         self._deq_offset = total
-        self._deq_alloc = alloc
-        return all_k, all_v
+        return self._k_deq_buf[..., :total, :], self._v_deq_buf[..., :total, :]
 
     def empty(self):
         return self.k_packed is None
@@ -319,8 +317,12 @@ class TurboQuantKVCache:
         else:
             total += (
                 self.v_packed[..., : self.offset, :].nbytes
-                + self.v_norms[..., : self.offset].nbytes
+                + self.v_norms[..., : self.offset, :].nbytes
             )
+        # Add prefix storage if present
+        if self._k_prefix is not None:
+            total += self._k_prefix.nbytes
+            total += self._v_prefix.nbytes
         return total
 
     @property
@@ -328,19 +330,25 @@ class TurboQuantKVCache:
         if self.k_packed is None:
             return []
         if self.v_bits is not None:
-            return [
+            state = [
                 self.k_packed[..., : self.offset, :],
                 self.k_norms[..., : self.offset],
                 self._v_quant[..., : self.offset, :],
                 self._v_scales[..., : self.offset, :],
                 self._v_biases[..., : self.offset, :],
             ]
-        return [
-            self.k_packed[..., : self.offset, :],
-            self.k_norms[..., : self.offset],
-            self.v_packed[..., : self.offset, :],
-            self.v_norms[..., : self.offset],
-        ]
+        else:
+            state = [
+                self.k_packed[..., : self.offset, :],
+                self.k_norms[..., : self.offset],
+                self.v_packed[..., : self.offset, :],
+                self.v_norms[..., : self.offset],
+            ]
+        # Include prefix storage if present
+        if self._k_prefix is not None:
+            state.append(self._k_prefix)
+            state.append(self._v_prefix)
+        return state
 
     @state.setter
     def state(self, v):
@@ -353,9 +361,17 @@ class TurboQuantKVCache:
                 self._v_quant,
                 self._v_scales,
                 self._v_biases,
-            ) = v
+            ) = v[:5]
+            # Restore prefix storage if present
+            if len(v) > 5:
+                self._k_prefix = v[5]
+                self._v_prefix = v[6]
         else:
-            self.k_packed, self.k_norms, self.v_packed, self.v_norms = v
+            self.k_packed, self.k_norms, self.v_packed, self.v_norms = v[:4]
+            # Restore prefix storage if present
+            if len(v) > 4:
+                self._k_prefix = v[4]
+                self._v_prefix = v[5]
         self.offset = self.k_packed.shape[2]
 
     _DTYPE_MAP = {
@@ -369,7 +385,7 @@ class TurboQuantKVCache:
     def meta_state(self):
         dtype_str = self._DTYPE_NAME.get(self._dtype, "float16")
         v_bits_str = str(self.v_bits) if self.v_bits is not None else "0"
-        return f"{self.offset},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str}"
+        return f"{self.offset},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str},{self.min_tokens_before_quant}"
 
     @meta_state.setter
     def meta_state(self, v):
@@ -390,6 +406,10 @@ class TurboQuantKVCache:
             self.v_bits = vb if vb > 0 else None
         else:
             self.v_bits = None
+        if len(parts) > 7:
+            self.min_tokens_before_quant = int(parts[7])
+        else:
+            self.min_tokens_before_quant = 128
 
     def dequantize(self):
         """Return full dequantized (keys, values) as dense arrays."""
@@ -432,6 +452,7 @@ class TurboQuantKVCache:
         c._v_deq_buf = None
         c._deq_offset = 0
         c._deq_alloc = 0
+        # Prefix storage is shared (shallow copy) — acceptable since it's immutable after write
         return c
 
     def __getstate__(self):
@@ -448,6 +469,9 @@ class TurboQuantKVCache:
         if isinstance(dtype_val, str):
             state["_dtype"] = TurboQuantKVCache._DTYPE_MAP.get(dtype_val, mx.float16)
         self.__dict__.update(state)
+        # Ensure min_tokens_before_quant exists for backward compatibility
+        if "min_tokens_before_quant" not in state:
+            self.min_tokens_before_quant = 128
 
     def is_trimmable(self):
         return True
@@ -459,6 +483,10 @@ class TurboQuantKVCache:
         self._v_deq_buf = None
         self._deq_offset = 0
         self._deq_alloc = 0
+        # Clear prefix storage if trimmed past it
+        if self.offset < self.min_tokens_before_quant:
+            self._k_prefix = None
+            self._v_prefix = None
         return n
 
     def size(self):
@@ -479,6 +507,8 @@ class TurboQuantKVCache:
         obj._v_quant = None
         obj._v_scales = None
         obj._v_biases = None
+        obj._k_prefix = None
+        obj._v_prefix = None
         obj._k_deq_buf = None
         obj._v_deq_buf = None
         obj._deq_offset = 0
@@ -492,6 +522,7 @@ class TurboQuantKVCache:
         obj._dtype = None
         obj.v_bits = None
         obj.v_group_size = 64
+        obj.min_tokens_before_quant = 128
         obj.meta_state = meta_state
         obj.state = state
         return obj
@@ -513,7 +544,7 @@ class BatchTurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, left_padding, bits=3, seed=42, v_bits=None):
+    def __init__(self, left_padding, bits=3, seed=42, v_bits=None, min_tokens_before_quant=128):
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-lp for lp in left_padding])
         self._idx = 0
@@ -521,6 +552,7 @@ class BatchTurboQuantKVCache:
         self.seed = seed
         self.v_bits = v_bits
         self.v_group_size = 64
+        self.min_tokens_before_quant = min_tokens_before_quant
         self._right_padding = None
 
         # Packed key storage: (B, H, max_len, packed_dim)
@@ -533,6 +565,10 @@ class BatchTurboQuantKVCache:
         self._v_quant = None
         self._v_scales = None
         self._v_biases = None
+
+        # FP16 prefix storage for attention sinks
+        self._k_prefix = None
+        self._v_prefix = None
 
         # Quantizer metadata (initialized on first update)
         self._k_q = None
@@ -559,6 +595,7 @@ class BatchTurboQuantKVCache:
                 bits=caches[0].quant_bits,
                 seed=caches[0].seed,
                 v_bits=caches[0].v_bits,
+                min_tokens_before_quant=caches[0].min_tokens_before_quant,
             )
 
         B = len(caches)
@@ -570,6 +607,7 @@ class BatchTurboQuantKVCache:
         bits = first.quant_bits
         seed = first.seed
         v_bits = first.v_bits
+        min_tokens = first.min_tokens_before_quant
         k_dim = first._k_dim
         v_dim = first._v_dim
         k_pdim = first._k_pdim
@@ -587,7 +625,7 @@ class BatchTurboQuantKVCache:
             v_pdim = packed_dim(v_dim, bits)
 
         # Allocate batched storage
-        cache = cls(padding, bits=bits, seed=seed, v_bits=v_bits)
+        cache = cls(padding, bits=bits, seed=seed, v_bits=v_bits, min_tokens_before_quant=min_tokens)
         cache._k_dim = k_dim
         cache._v_dim = v_dim
         cache._k_pdim = k_pdim
@@ -729,51 +767,75 @@ class BatchTurboQuantKVCache:
         self._ensure_quantizer(k_dim, v_dim)
         self._ensure_storage(B, H, S)
 
-        # Fused Metal quantize for keys
-        k_pk, k_nrm = fused_quantize(
-            keys.reshape(-1, k_dim),
-            self._k_q.signs,
-            self._k_q.boundaries,
-            k_dim,
-            self.quant_bits,
-        )
-        k_pk = k_pk.reshape(B, H, S, self._k_pdim)
-        k_nrm = k_nrm.reshape(B, H, S)
+        # Determine prefix boundary (global across all sequences)
+        prefix_end = self.min_tokens_before_quant
+        quant_start = max(0, prefix_end - self._idx)
+        quant_len = S - quant_start
 
-        # Write to batched buffer with left-padding
-        for i in range(B):
-            p = self.left_padding[i].item()
-            self.k_packed[i : i + 1, :, p : p + S, :] = k_pk[i : i + 1]
-            self.k_norms[i : i + 1, :, p : p + S] = k_nrm[i : i + 1]
+        # Store prefix tokens in fp16 (attention sinks)
+        if quant_start > 0:
+            # Ensure prefix storage is allocated
+            if self._k_prefix is None:
+                alloc = ((prefix_end + self.step - 1) // self.step) * self.step
+                self._k_prefix = mx.zeros((B, H, alloc, k_dim), dtype=keys.dtype)
+                self._v_prefix = mx.zeros((B, H, alloc, v_dim), dtype=values.dtype)
+            # Copy only the actual prefix tokens (may be less than quant_start if S < quant_start)
+            actual_prefix = min(quant_start, S)
+            prefix_keys = keys[..., :actual_prefix, :]
+            prefix_values = values[..., :actual_prefix, :]
+            self._k_prefix[..., self._idx : self._idx + actual_prefix, :] = prefix_keys
+            self._v_prefix[..., self._idx : self._idx + actual_prefix, :] = prefix_values
 
-        if self.v_bits is not None:
-            vq, vs, vb = mx.quantize(
-                values, group_size=self.v_group_size, bits=self.v_bits
-            )
-            for i in range(B):
-                p = self.left_padding[i].item()
-                self._v_quant[i : i + 1, :, p : p + S, :] = vq[i : i + 1]
-                self._v_scales[i : i + 1, :, p : p + S, :] = vs[i : i + 1]
-                self._v_biases[i : i + 1, :, p : p + S, :] = vb[i : i + 1]
-        else:
-            v_pk, v_nrm = fused_quantize(
-                values.reshape(-1, v_dim),
-                self._v_q.signs,
-                self._v_q.boundaries,
-                v_dim,
+        # Quantize tokens beyond the prefix threshold
+        if quant_len > 0:
+            q_keys = keys[..., quant_start:, :] if quant_start > 0 else keys
+            q_values = values[..., quant_start:, :] if quant_start > 0 else values
+
+            # Fused Metal quantize for keys
+            k_pk, k_nrm = fused_quantize(
+                q_keys.reshape(-1, k_dim),
+                self._k_q.signs,
+                self._k_q.boundaries,
+                k_dim,
                 self.quant_bits,
             )
-            v_pk = v_pk.reshape(B, H, S, self._v_pdim)
-            v_nrm = v_nrm.reshape(B, H, S)
+            k_pk = k_pk.reshape(B, H, quant_len, self._k_pdim)
+            k_nrm = k_nrm.reshape(B, H, quant_len)
+
+            # Write to batched buffer with left-padding
             for i in range(B):
                 p = self.left_padding[i].item()
-                self.v_packed[i : i + 1, :, p : p + S, :] = v_pk[i : i + 1]
-                self.v_norms[i : i + 1, :, p : p + S] = v_nrm[i : i + 1]
+                self.k_packed[i : i + 1, :, p + quant_start : p + S, :] = k_pk[i : i + 1]
+                self.k_norms[i : i + 1, :, p + quant_start : p + S] = k_nrm[i : i + 1]
+
+            if self.v_bits is not None:
+                vq, vs, vb = mx.quantize(
+                    q_values, group_size=self.v_group_size, bits=self.v_bits
+                )
+                for i in range(B):
+                    p = self.left_padding[i].item()
+                    self._v_quant[i : i + 1, :, p + quant_start : p + S, :] = vq[i : i + 1]
+                    self._v_scales[i : i + 1, :, p + quant_start : p + S, :] = vs[i : i + 1]
+                    self._v_biases[i : i + 1, :, p + quant_start : p + S, :] = vb[i : i + 1]
+            else:
+                v_pk, v_nrm = fused_quantize(
+                    q_values.reshape(-1, v_dim),
+                    self._v_q.signs,
+                    self._v_q.boundaries,
+                    v_dim,
+                    self.quant_bits,
+                )
+                v_pk = v_pk.reshape(B, H, quant_len, self._v_pdim)
+                v_nrm = v_nrm.reshape(B, H, quant_len)
+                for i in range(B):
+                    p = self.left_padding[i].item()
+                    self.v_packed[i : i + 1, :, p + quant_start : p + S, :] = v_pk[i : i + 1]
+                    self.v_norms[i : i + 1, :, p + quant_start : p + S] = v_nrm[i : i + 1]
 
         self._idx += S
         total = self._idx
 
-        # Dequantize and return
+        # Build dequantized output: prefix tokens from fp16 storage, rest from dequant
         all_k = self._full_dequant(
             self.k_packed, self.k_norms, self._k_q, k_dim, B, H, total, keys.dtype
         )
@@ -783,6 +845,13 @@ class BatchTurboQuantKVCache:
             all_v = self._full_dequant(
                 self.v_packed, self.v_norms, self._v_q, v_dim, B, H, total, values.dtype
             )
+
+        # Replace quantized prefix tokens with raw fp16 values
+        if quant_start > 0:
+            actual_prefix = min(quant_start, S)
+            all_k[..., :actual_prefix, :] = self._k_prefix[..., self._idx - actual_prefix : self._idx, :]
+            all_v[..., :actual_prefix, :] = self._v_prefix[..., self._idx - actual_prefix : self._idx, :]
+
         return all_k, all_v
 
     def empty(self):
@@ -807,6 +876,10 @@ class BatchTurboQuantKVCache:
                 self.v_packed[..., : self._idx, :].nbytes
                 + self.v_norms[..., : self._idx].nbytes
             )
+        # Add prefix storage if present
+        if self._k_prefix is not None:
+            total += self._k_prefix.nbytes
+            total += self._v_prefix.nbytes
         return total
 
     @property
@@ -814,7 +887,7 @@ class BatchTurboQuantKVCache:
         if self.k_packed is None:
             return []
         if self.v_bits is not None:
-            return [
+            state = [
                 self.k_packed[..., : self._idx, :],
                 self.k_norms[..., : self._idx],
                 self._v_quant[..., : self._idx, :],
@@ -823,14 +896,20 @@ class BatchTurboQuantKVCache:
                 self.left_padding,
                 self.offset,
             ]
-        return [
-            self.k_packed[..., : self._idx, :],
-            self.k_norms[..., : self._idx],
-            self.v_packed[..., : self._idx, :],
-            self.v_norms[..., : self._idx],
-            self.left_padding,
-            self.offset,
-        ]
+        else:
+            state = [
+                self.k_packed[..., : self._idx, :],
+                self.k_norms[..., : self._idx],
+                self.v_packed[..., : self._idx, :],
+                self.v_norms[..., : self._idx],
+                self.left_padding,
+                self.offset,
+            ]
+        # Include prefix storage if present
+        if self._k_prefix is not None:
+            state.append(self._k_prefix)
+            state.append(self._v_prefix)
+        return state
 
     @state.setter
     def state(self, v):
@@ -845,25 +924,31 @@ class BatchTurboQuantKVCache:
                 self._v_biases,
             ) = v[:5]
             self.left_padding, self.offset = v[5], v[6]
+            # Restore prefix storage if present
+            if len(v) > 7:
+                self._k_prefix = v[7]
+                self._v_prefix = v[8]
         else:
             self.k_packed, self.k_norms, self.v_packed, self.v_norms = v[:4]
             self.left_padding, self.offset = v[4], v[5]
+            # Restore prefix storage if present
+            if len(v) > 6:
+                self._k_prefix = v[6]
+                self._v_prefix = v[7]
         self._idx = self.k_packed.shape[2]
 
     @property
     def meta_state(self):
         dtype_str = TurboQuantKVCache._DTYPE_NAME.get(self._dtype, "float16")
         v_bits_str = str(self.v_bits) if self.v_bits is not None else "0"
-        return f"{self._idx},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str}"
+        return f"{self._idx},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str},{self.min_tokens_before_quant}"
 
     @meta_state.setter
     def meta_state(self, v):
         parts = v.split(",")
-        self._idx, self.quant_bits, self.seed = (
-            int(parts[0]),
-            int(parts[1]),
-            int(parts[2]),
-        )
+        self._idx = int(parts[0])
+        self.quant_bits = int(parts[1])
+        self.seed = int(parts[2])
         self._k_dim = int(parts[3]) or None
         self._v_dim = int(parts[4]) or None
         if len(parts) > 5:
@@ -875,6 +960,10 @@ class BatchTurboQuantKVCache:
             self.v_bits = vb if vb > 0 else None
         else:
             self.v_bits = None
+        if len(parts) > 7:
+            self.min_tokens_before_quant = int(parts[7])
+        else:
+            self.min_tokens_before_quant = 128
 
     def size(self):
         return self._idx

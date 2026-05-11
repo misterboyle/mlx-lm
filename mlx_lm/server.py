@@ -471,11 +471,15 @@ class ResponseGenerator:
             model_provider.cli_args, "turbo_fp16_layers", 1
         )
         self._turbo_v_bits = getattr(model_provider.cli_args, "turbo_v_bits", None)
+        self._turbo_min_tokens_before_quant = getattr(
+            model_provider.cli_args, "turbo_min_tokens_before_quant", 128
+        )
         logging.info(
             f"[TURBO] ResponseGenerator initialized: "
             f"turbo_kv_bits={self._turbo_kv_bits} (type={type(self._turbo_kv_bits).__name__}), "
             f"turbo_fp16_layers={self._turbo_fp16_layers}, "
-            f"turbo_v_bits={self._turbo_v_bits}"
+            f"turbo_v_bits={self._turbo_v_bits}, "
+            f"turbo_min_tokens_before_quant={self._turbo_min_tokens_before_quant}"
         )
         logging.info(
             f"[TURBO] model_provider.cli_args type={type(model_provider.cli_args).__name__}, "
@@ -902,6 +906,7 @@ class ResponseGenerator:
                         turbo_kv_bits=self._turbo_kv_bits,
                         turbo_fp16_layers=self._turbo_fp16_layers,
                         turbo_v_bits=self._turbo_v_bits,
+                        turbo_min_tokens_before_quant=self._turbo_min_tokens_before_quant,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -1057,6 +1062,7 @@ class ResponseGenerator:
                     turbo_kv_bits=self._turbo_kv_bits,
                     turbo_fp16_layers=self._turbo_fp16_layers,
                     turbo_v_bits=self._turbo_v_bits,
+                    turbo_min_tokens_before_quant=self._turbo_min_tokens_before_quant,
                 )
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
@@ -1994,6 +2000,13 @@ def main():
         default=None,
         help="Use standard affine quantization for values at the given "
         "bit width (e.g. 4) instead of PolarQuant. Requires --turbo-kv-bits.",
+    )
+    parser.add_argument(
+        "--turbo-min-tokens-before-quant",
+        type=int,
+        default=128,
+        help="Keep the first N tokens in uncompressed fp16 for attention "
+        "sinks (system prompt preservation). Default: 128.",
     )
     parser.add_argument(
         "--max-resident-experts",

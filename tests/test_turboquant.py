@@ -226,7 +226,7 @@ class TestTurboQuantKVCache(unittest.TestCase):
 
     def test_compression_ratio(self):
         """TurboQuant should use less memory than FP16."""
-        cache = TurboQuantKVCache(bits=3)
+        cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=0)  # No prefix, all quantized
         B, H, S, D = 1, 8, 100, 128
         k = mx.random.normal(shape=(B, H, S, D))
         v = mx.random.normal(shape=(B, H, S, D))
@@ -264,7 +264,7 @@ class TestTurboQuantKVCache(unittest.TestCase):
         self.assertTrue(cache.is_trimmable())
 
     def test_state_property(self):
-        cache = TurboQuantKVCache(bits=3)
+        cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=0)  # No prefix, all quantized
 
         # Empty cache returns empty list
         self.assertEqual(cache.state, [])
@@ -1249,6 +1249,130 @@ class TestTurboQuantDeepCopy(unittest.TestCase):
         self.assertEqual(cache.quant_bits, 2)
         self.assertEqual(cache.seed, 99)
         self.assertEqual(cache.v_bits, 4)
+
+
+class TestAttentionSinks(unittest.TestCase):
+    """Tests for attention sinks (fp16 prefix) feature."""
+
+    @classmethod
+    def setUpClass(cls):
+        from mlx_lm.utils import load
+
+        cls.model, cls.tokenizer = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+
+    def test_prefix_stored_in_fp16(self):
+        """First N tokens should be stored in fp16, not quantized."""
+        cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=10)
+        B, H, S, D = 1, 4, 20, 64
+
+        # First 10 tokens (prefix)
+        k1 = mx.random.normal(shape=(B, H, 10, D))
+        v1 = mx.random.normal(shape=(B, H, 10, D))
+        cache.update_and_fetch(k1, v1)
+
+        # Check that prefix storage exists
+        self.assertIsNotNone(cache._k_prefix)
+        self.assertIsNotNone(cache._v_prefix)
+
+        # Check that prefix tokens are stored in fp16 (not quantized)
+        # The dequantized output should match the original fp16 values
+        k_ret, v_ret = cache._k_deq_buf[..., :10, :], cache._v_deq_buf[..., :10, :]
+        mx.eval(k_ret, v_ret, k1, v1)
+        self.assertTrue(mx.allclose(k_ret, k1, atol=1e-3))
+        self.assertTrue(mx.allclose(v_ret, v1, atol=1e-3))
+
+    def test_tokens_after_prefix_are_quantized(self):
+        """Tokens beyond min_tokens_before_quant should be quantized."""
+        cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=10)
+        B, H, S, D = 1, 4, 20, 64
+
+        # First 10 tokens (prefix)
+        k1 = mx.random.normal(shape=(B, H, 10, D))
+        v1 = mx.random.normal(shape=(B, H, 10, D))
+        cache.update_and_fetch(k1, v1)
+
+        # Next 10 tokens (quantized)
+        k2 = mx.random.normal(shape=(B, H, 10, D))
+        v2 = mx.random.normal(shape=(B, H, 10, D))
+        cache.update_and_fetch(k2, v2)
+
+        # Check that quantized storage exists
+        self.assertIsNotNone(cache.k_packed)
+        self.assertIsNotNone(cache.v_packed)
+
+        # Check that quantized tokens are approximately correct (quantization loss)
+        k_ret, v_ret = cache._k_deq_buf[..., 10:20, :], cache._v_deq_buf[..., 10:20, :]
+        mx.eval(k_ret, v_ret, k2, v2)
+        # Quantization should preserve structure (cosine similarity > 0.85)
+        k_cos = mx.sum(k_ret * k2) / (mx.linalg.norm(k_ret) * mx.linalg.norm(k2) + 1e-8)
+        v_cos = mx.sum(v_ret * v2) / (mx.linalg.norm(v_ret) * mx.linalg.norm(v2) + 1e-8)
+        self.assertGreater(k_cos.item(), 0.85)
+        self.assertGreater(v_cos.item(), 0.85)
+
+    def test_state_roundtrip_with_prefix(self):
+        """State roundtrip should preserve prefix storage."""
+        cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=10)
+        B, H, S, D = 1, 4, 15, 64
+
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        cache.update_and_fetch(k, v)
+
+        state = cache.state
+        meta = cache.meta_state
+
+        new_cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=10)
+        new_cache.state = state
+        new_cache.meta_state = meta
+
+        # Check that prefix storage was restored
+        self.assertIsNotNone(new_cache._k_prefix)
+        self.assertIsNotNone(new_cache._v_prefix)
+
+        # Check that prefix tokens match (dequantize both and compare)
+        k_orig, v_orig = cache.dequantize()
+        k_new, v_new = new_cache.dequantize()
+        mx.eval(k_orig, k_new)
+        self.assertTrue(mx.allclose(k_orig, k_new, atol=1e-5))
+
+    def test_batch_attention_sinks(self):
+        """BatchTurboQuantKVCache should handle attention sinks."""
+        cache = BatchTurboQuantKVCache(left_padding=[0, 0], bits=3, min_tokens_before_quant=10)
+        B, H, S, D = 2, 4, 20, 64
+
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        k_ret, v_ret = cache.update_and_fetch(k, v)
+
+        # Check that prefix storage exists
+        self.assertIsNotNone(cache._k_prefix)
+        self.assertIsNotNone(cache._v_prefix)
+
+        # Check that prefix storage has correct shape
+        self.assertEqual(cache._k_prefix.shape[2], 256)  # step-aligned
+        self.assertEqual(cache._k_prefix.shape[:3], (B, H, 256))
+
+        # Check that dequantized output has correct shape
+        mx.eval(k_ret, v_ret)
+        self.assertEqual(k_ret.shape, (B, H, S, D))
+        self.assertEqual(v_ret.shape, (B, H, S, D))
+
+    def test_no_prefix_when_min_tokens_zero(self):
+        """When min_tokens_before_quant=0, no prefix storage should be allocated."""
+        cache = TurboQuantKVCache(bits=3, min_tokens_before_quant=0)
+        B, H, S, D = 1, 4, 10, 64
+
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        cache.update_and_fetch(k, v)
+
+        # Check that no prefix storage was allocated
+        self.assertIsNone(cache._k_prefix)
+        self.assertIsNone(cache._v_prefix)
+
+        # Check that quantized storage exists
+        self.assertIsNotNone(cache.k_packed)
+        self.assertIsNotNone(cache.v_packed)
 
 
 if __name__ == "__main__":

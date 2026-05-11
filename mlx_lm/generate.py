@@ -231,6 +231,13 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--turbo-min-tokens-before-quant",
+        type=int,
+        help="Keep the first N tokens in uncompressed fp16 for attention "
+        "sinks (system prompt preservation). Default: 128.",
+        default=128,
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -355,6 +362,7 @@ def generate_step(
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
     turbo_v_bits: Optional[int] = None,
+    turbo_min_tokens_before_quant: int = 128,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -426,6 +434,7 @@ def generate_step(
             turbo_kv_bits=turbo_kv_bits,
             turbo_fp16_layers=turbo_fp16_layers,
             turbo_v_bits=turbo_v_bits,
+            turbo_min_tokens_before_quant=turbo_min_tokens_before_quant,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -1579,6 +1588,7 @@ class BatchGenerator:
         turbo_kv_bits: Optional[int] = None,
         turbo_fp16_layers: int = 1,
         turbo_v_bits: Optional[int] = None,
+        turbo_min_tokens_before_quant: int = 128,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1592,6 +1602,7 @@ class BatchGenerator:
         self.turbo_kv_bits = turbo_kv_bits
         self.turbo_fp16_layers = turbo_fp16_layers
         self.turbo_v_bits = turbo_v_bits
+        self.turbo_min_tokens_before_quant = turbo_min_tokens_before_quant
 
         self._stream = stream or generation_stream
 
@@ -1740,6 +1751,7 @@ class BatchGenerator:
                 turbo_kv_bits=self.turbo_kv_bits,
                 turbo_fp16_layers=self.turbo_fp16_layers,
                 turbo_v_bits=self.turbo_v_bits,
+                turbo_min_tokens_before_quant=self.turbo_min_tokens_before_quant,
             )
 
         logging.info(
@@ -1760,6 +1772,7 @@ class BatchGenerator:
                 turbo_kv_bits=self.turbo_kv_bits,
                 turbo_fp16_layers=self.turbo_fp16_layers,
                 turbo_v_bits=self.turbo_v_bits,
+                turbo_min_tokens_before_quant=self.turbo_min_tokens_before_quant,
             )
         ]
 
@@ -2196,6 +2209,7 @@ def main():
         turbo_kv_bits=args.turbo_kv_bits,
         turbo_fp16_layers=args.turbo_fp16_layers,
         turbo_v_bits=args.turbo_v_bits,
+        turbo_min_tokens_before_quant=args.turbo_min_tokens_before_quant,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )

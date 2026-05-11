@@ -73,6 +73,7 @@ def make_prompt_cache(
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
     turbo_v_bits: Optional[int] = None,
+    turbo_min_tokens_before_quant: int = 128,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -94,6 +95,8 @@ def make_prompt_cache(
             quantization at the given bit width for values instead of
             PolarQuant. Values tolerate simple quantization well.
             Default: ``None`` (use PolarQuant for values too).
+        turbo_min_tokens_before_quant (int): Keep the first N tokens in
+            uncompressed fp16 for attention sinks. Default: ``128``.
     """
     # Debug logging: trace the decision path
     logger.info("=" * 60)
@@ -175,7 +178,7 @@ def make_prompt_cache(
                 elif isinstance(c, (KVCache, RotatingKVCache)):
                     # Standard attention cache — replace with TurboQuant
                     quantized.append(
-                        TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits)
+                        TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits, min_tokens_before_quant=turbo_min_tokens_before_quant)
                     )
                     quantized_count += 1
                 else:
@@ -225,7 +228,7 @@ def make_prompt_cache(
                 caches.append(KVCache())
             else:
                 caches.append(
-                    TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits)
+                    TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits, min_tokens_before_quant=turbo_min_tokens_before_quant)
                 )
         _log_cache_stats(caches, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits)
         logger.info(
@@ -651,10 +654,10 @@ class KVCache(_BaseCache):
             )
         return quant_cache
 
-    def to_turbo_quantized(self, bits: int = 3, v_bits: int = None):
+    def to_turbo_quantized(self, bits: int = 3, v_bits: int = None, min_tokens_before_quant: int = 128):
         from mlx_lm.models.turboquant_cache import TurboQuantKVCache
 
-        tq_cache = TurboQuantKVCache(bits=bits, v_bits=v_bits)
+        tq_cache = TurboQuantKVCache(bits=bits, v_bits=v_bits, min_tokens_before_quant=min_tokens_before_quant)
         if self.keys is not None:
             tq_cache.update_and_fetch(
                 self.keys[..., : self.offset, :],
