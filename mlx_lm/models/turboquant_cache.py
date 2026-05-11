@@ -768,10 +768,6 @@ class BatchTurboQuantKVCache:
         self._ensure_quantizer(k_dim, v_dim)
         self._ensure_storage(B, H, S)
 
-        import os
-        if os.environ.get('TQ_DEBUG'):
-            print(f"[TQ-DEBUG] ENTER: B={B}, H={H}, S={S}, _idx={self._idx}, _prefix_len={self._prefix_len}, id={id(self)}, k_prefix={self._k_prefix is not None}")
-
         # Determine prefix boundary (global across all sequences)
         prefix_end = self.min_tokens_before_quant
         quant_start = max(0, prefix_end - self._idx)
@@ -792,10 +788,7 @@ class BatchTurboQuantKVCache:
             self._k_prefix[..., self._prefix_len : self._prefix_len + actual_prefix, :] = prefix_keys
             self._v_prefix[..., self._prefix_len : self._prefix_len + actual_prefix, :] = prefix_values
             # Track cumulative prefix length for replacement
-            old_prefix = self._prefix_len
             self._prefix_len += actual_prefix
-            if os.environ.get('TQ_DEBUG'):
-                print(f"[TQ-DEBUG] prefix: _prefix_len {old_prefix} -> {self._prefix_len} (actual_prefix={actual_prefix})")
 
         # Quantize tokens beyond the prefix threshold
         if quant_len > 0:
@@ -845,8 +838,6 @@ class BatchTurboQuantKVCache:
 
         self._idx += S
         total = self._idx
-        if os.environ.get('TQ_DEBUG'):
-            print(f"[TQ-DEBUG] after update: _idx={self._idx}, _prefix_len={self._prefix_len}, total={total}")
 
         # Build dequantized output: prefix tokens from fp16 storage, rest from dequant
         all_k = self._full_dequant(
@@ -861,16 +852,8 @@ class BatchTurboQuantKVCache:
 
         # Replace quantized prefix tokens with raw fp16 values
         if self._prefix_len > 0:
-            if os.environ.get('TQ_DEBUG'):
-                print(f"[TQ-DEBUG] replace: id={id(self)}, _prefix_len={self._prefix_len}, _idx={self._idx}, total={total}, all_k.shape={all_k.shape}")
-            try:
-                all_k[..., :self._prefix_len, :] = self._k_prefix[..., :self._prefix_len, :]
-                all_v[..., :self._prefix_len, :] = self._v_prefix[..., :self._prefix_len, :]
-            except ValueError as e:
-                if os.environ.get('TQ_DEBUG'):
-                    print(f"[TQ-DEBUG] ERROR: id={id(self)}, {e}")
-                    print(f"[TQ-DEBUG] ERROR STATE: id={id(self)}, _idx={self._idx}, _prefix_len={self._prefix_len}, total={total}, k_prefix.shape={self._k_prefix.shape if self._k_prefix is not None else None}, v_prefix.shape={self._v_prefix.shape if self._v_prefix is not None else None}")
-                raise
+            all_k[..., :self._prefix_len, :] = self._k_prefix[..., :self._prefix_len, :]
+            all_v[..., :self._prefix_len, :] = self._v_prefix[..., :self._prefix_len, :]
 
         return all_k, all_v
 
@@ -1000,16 +983,11 @@ class BatchTurboQuantKVCache:
         return True
 
     def trim(self, n):
-        import os
-        if os.environ.get('TQ_DEBUG'):
-            print(f"[TQ-DEBUG] trim: n={n}, _idx={self._idx}, _prefix_len={self._prefix_len}, id={id(self)}")
         n = min(self._idx, n)
         self._idx -= n
         # Reset prefix tracking — trimmed tokens may have included prefix tokens
         # and the cumulative counter is no longer valid
         self._prefix_len = 0
-        if os.environ.get('TQ_DEBUG'):
-            print(f"[TQ-DEBUG] trim after: _idx={self._idx}, _prefix_len={self._prefix_len}")
         return n
 
     def make_mask(self, *args, **kwargs):
@@ -1023,9 +1001,6 @@ class BatchTurboQuantKVCache:
         Mirrors BatchKVCache.filter: selects rows by index, then shifts
         left to reduce padding.
         """
-        import os
-        if os.environ.get('TQ_DEBUG'):
-            print(f"[TQ-DEBUG] filter: batch_indices={batch_indices}, _idx={self._idx}, _prefix_len={self._prefix_len}, id={id(self)}")
         # Convert to mx.array with proper dtype for indexing
         if isinstance(batch_indices, list):
             batch_indices = mx.array(batch_indices, dtype=mx.int32)
@@ -1043,8 +1018,6 @@ class BatchTurboQuantKVCache:
             self.left_padding = mx.array([], dtype=mx.int32)
             self._idx = 0
             self._prefix_len = 0
-            if os.environ.get('TQ_DEBUG'):
-                print(f"[TQ-DEBUG] filter empty: _idx={self._idx}, _prefix_len={self._prefix_len}")
             return
 
         if self.k_packed is not None:
