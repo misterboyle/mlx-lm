@@ -11,11 +11,22 @@
   3. **Reset `_prefix_len` in `trim()` and `filter()`** — these methods reset `_idx` but not `_prefix_len`, causing stale state.
 - **Opencode test passes** — first message and continuation both work correctly
 - **All 78 unit tests pass**
+- **Bug bead created and closed**: hq-9mm.1 — "Bug: BatchTurboQuantKVCache prefix storage shape mismatch after batch filtering"
 
 ### Previous sessions (committed)
 - Quantize-on-write lifecycle (hq-c19) — `update_and_fetch` uses `fused_quantize`
 - Hybrid attention awareness (hq-vvj) — per-layer cache type detection for Qwen3.6 MoE
 - Attention sinks (hq-9mm) — `min_tokens_before_quant` parameter keeps first N tokens in fp16
+
+## In Progress
+
+### Quality comparison testing (started but not completed)
+- Started comparing response quality across:
+  - Baseline (no TurboQuant)
+  - TurboQuant 4-bit
+  - TurboQuant 3-bit
+- Need to run proper opencode tests with longer generations (200 tokens was too short)
+- Use opencode, not curl, for meaningful quality assessment
 
 ## Pending
 
@@ -29,6 +40,7 @@
   - Depends on hq-0f9
 
 ### Future
+- Complete quality comparison testing (opencode with longer generations)
 - Compare TurboQuant quality vs baseline (already observed degradation)
 - Consider if fused FA kernel (hq-0f9) would help quality or just memory
 
@@ -69,6 +81,7 @@
     ├── hq-0f9: Promote fused FA kernel for packed TQ3 K/V reads [P1] (open)
     ├── hq-0ir: Wire symmetric K quantization via prerot_fused_qk_scores [P2] (open)
     ├── hq-9mm: Integrate attention sinks -- fp16 prefix for first N tokens [P1] (✓ closed)
+    │   └── hq-9mm.1: Bug: BatchTurboQuantKVCache prefix storage shape mismatch [P1] (✓ closed)
     ├── hq-c19: Implement quantize-on-write KV cache lifecycle [P0] (✓ closed)
     └── hq-vvj: Add hybrid attention awareness for Qwen3.6 MoE [P0] (✓ closed)
 ```
