@@ -861,14 +861,14 @@ class BatchTurboQuantKVCache:
         # Replace quantized prefix tokens with raw fp16 values
         if self._prefix_len > 0:
             if os.environ.get('TQ_DEBUG'):
-                print(f"[TQ-DEBUG] replace: _prefix_len={self._prefix_len}, _idx={self._idx}, total={total}, all_k.shape={all_k.shape}")
+                print(f"[TQ-DEBUG] replace: id={id(self)}, _prefix_len={self._prefix_len}, _idx={self._idx}, total={total}, all_k.shape={all_k.shape}")
             try:
                 all_k[..., :self._prefix_len, :] = self._k_prefix[..., self._idx - self._prefix_len : self._idx, :]
                 all_v[..., :self._prefix_len, :] = self._v_prefix[..., self._idx - self._prefix_len : self._idx, :]
             except ValueError as e:
                 if os.environ.get('TQ_DEBUG'):
-                    print(f"[TQ-DEBUG] ERROR: {e}")
-                    print(f"[TQ-DEBUG] ERROR STATE: _idx={self._idx}, _prefix_len={self._prefix_len}, total={total}, k_prefix.shape={self._k_prefix.shape if self._k_prefix is not None else None}, v_prefix.shape={self._v_prefix.shape if self._v_prefix is not None else None}")
+                    print(f"[TQ-DEBUG] ERROR: id={id(self)}, {e}")
+                    print(f"[TQ-DEBUG] ERROR STATE: id={id(self)}, _idx={self._idx}, _prefix_len={self._prefix_len}, total={total}, k_prefix.shape={self._k_prefix.shape if self._k_prefix is not None else None}, v_prefix.shape={self._v_prefix.shape if self._v_prefix is not None else None}")
                 raise
 
         return all_k, all_v
