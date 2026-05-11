@@ -994,6 +994,9 @@ class BatchTurboQuantKVCache:
             print(f"[TQ-DEBUG] trim: n={n}, _idx={self._idx}, _prefix_len={self._prefix_len}")
         n = min(self._idx, n)
         self._idx -= n
+        # Reset prefix tracking — trimmed tokens may have included prefix tokens
+        # and the cumulative counter is no longer valid
+        self._prefix_len = 0
         if os.environ.get('TQ_DEBUG'):
             print(f"[TQ-DEBUG] trim after: _idx={self._idx}, _prefix_len={self._prefix_len}")
         return n
