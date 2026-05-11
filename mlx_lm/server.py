@@ -1190,6 +1190,30 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _log_kv_cache_stats(self):
+        """Log KV cache memory stats after each request."""
+        try:
+            rg = self.response_generator
+            if hasattr(rg, "batch_generator") and rg.batch_generator is not None:
+                bg = rg.batch_generator
+                if hasattr(bg, "prompt_cache") and bg.prompt_cache is not None:
+                    pc = bg.prompt_cache
+                    total_bytes = pc.nbytes
+                    total_gb = total_bytes / 1e9
+                    logging.info(
+                        f"KV Cache: {total_gb:.2f} GB "
+                        f"({total_bytes / 1024 / 1024:.0f} MB)"
+                    )
+                    # Break down by cache type
+                    if hasattr(pc, "stats_by_type"):
+                        for name, stats in pc.stats_by_type().items():
+                            gb = stats["n_bytes"] / 1e9
+                            logging.info(
+                                f"  {name}: {gb:.2f} GB ({stats['n_sequences']} seq)"
+                            )
+        except Exception:
+            pass  # Non-critical, don't break request handling
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -1646,6 +1670,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         finally:
             ctx.stop()
+            # Log KV cache stats after every request (not just on creation)
+            self._log_kv_cache_stats()
 
     def completion_usage_response(
         self,
