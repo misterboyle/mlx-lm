@@ -770,7 +770,7 @@ class BatchTurboQuantKVCache:
 
         import os
         if os.environ.get('TQ_DEBUG'):
-            print(f"[TQ-DEBUG] update_and_fetch: _idx={self._idx}, _prefix_len={self._prefix_len}, S={S}, min_tokens_before_quant={self.min_tokens_before_quant}")
+            print(f"[TQ-DEBUG] update_and_fetch: B={B}, H={H}, S={S}, _idx={self._idx}, _prefix_len={self._prefix_len}, min_tokens_before_quant={self.min_tokens_before_quant}, id={id(self)}")
 
         # Determine prefix boundary (global across all sequences)
         prefix_end = self.min_tokens_before_quant
@@ -857,7 +857,7 @@ class BatchTurboQuantKVCache:
         if self._prefix_len > 0:
             import os
             if os.environ.get('TQ_DEBUG'):
-                print(f"[TQ-DEBUG] replace: _prefix_len={self._prefix_len}, _idx={self._idx}, total={total}, all_k.shape={all_k.shape}")
+                print(f"[TQ-DEBUG] replace: B={B}, H={H}, S={total}, _prefix_len={self._prefix_len}, _idx={self._idx}, all_k.shape={all_k.shape}, id={id(self)}")
             all_k[..., :self._prefix_len, :] = self._k_prefix[..., self._idx - self._prefix_len : self._idx, :]
             all_v[..., :self._prefix_len, :] = self._v_prefix[..., self._idx - self._prefix_len : self._idx, :]
 
