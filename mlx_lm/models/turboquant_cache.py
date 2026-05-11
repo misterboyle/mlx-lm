@@ -1057,6 +1057,10 @@ class BatchTurboQuantKVCache:
             else:
                 self.v_packed = self.v_packed[batch_indices]
                 self.v_norms = self.v_norms[batch_indices]
+        # Filter prefix storage too
+        if self._k_prefix is not None:
+            self._k_prefix = self._k_prefix[batch_indices]
+            self._v_prefix = self._v_prefix[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
