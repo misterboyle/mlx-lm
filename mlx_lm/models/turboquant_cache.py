@@ -788,8 +788,9 @@ class BatchTurboQuantKVCache:
             actual_prefix = min(quant_start, S)
             prefix_keys = keys[..., :actual_prefix, :]
             prefix_values = values[..., :actual_prefix, :]
-            self._k_prefix[..., self._idx : self._idx + actual_prefix, :] = prefix_keys
-            self._v_prefix[..., self._idx : self._idx + actual_prefix, :] = prefix_values
+            # Store at the beginning of the prefix buffer, not at _idx (which is global)
+            self._k_prefix[..., self._prefix_len : self._prefix_len + actual_prefix, :] = prefix_keys
+            self._v_prefix[..., self._prefix_len : self._prefix_len + actual_prefix, :] = prefix_values
             # Track cumulative prefix length for replacement
             old_prefix = self._prefix_len
             self._prefix_len += actual_prefix
@@ -863,8 +864,8 @@ class BatchTurboQuantKVCache:
             if os.environ.get('TQ_DEBUG'):
                 print(f"[TQ-DEBUG] replace: id={id(self)}, _prefix_len={self._prefix_len}, _idx={self._idx}, total={total}, all_k.shape={all_k.shape}")
             try:
-                all_k[..., :self._prefix_len, :] = self._k_prefix[..., self._idx - self._prefix_len : self._idx, :]
-                all_v[..., :self._prefix_len, :] = self._v_prefix[..., self._idx - self._prefix_len : self._idx, :]
+                all_k[..., :self._prefix_len, :] = self._k_prefix[..., :self._prefix_len, :]
+                all_v[..., :self._prefix_len, :] = self._v_prefix[..., :self._prefix_len, :]
             except ValueError as e:
                 if os.environ.get('TQ_DEBUG'):
                     print(f"[TQ-DEBUG] ERROR: id={id(self)}, {e}")
