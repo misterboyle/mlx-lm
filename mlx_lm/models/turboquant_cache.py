@@ -768,6 +768,10 @@ class BatchTurboQuantKVCache:
         self._ensure_quantizer(k_dim, v_dim)
         self._ensure_storage(B, H, S)
 
+        import os
+        if os.environ.get('TQ_DEBUG'):
+            print(f"[TQ-DEBUG] update_and_fetch: _idx={self._idx}, _prefix_len={self._prefix_len}, S={S}, min_tokens_before_quant={self.min_tokens_before_quant}")
+
         # Determine prefix boundary (global across all sequences)
         prefix_end = self.min_tokens_before_quant
         quant_start = max(0, prefix_end - self._idx)
@@ -851,6 +855,9 @@ class BatchTurboQuantKVCache:
 
         # Replace quantized prefix tokens with raw fp16 values
         if self._prefix_len > 0:
+            import os
+            if os.environ.get('TQ_DEBUG'):
+                print(f"[TQ-DEBUG] replace: _prefix_len={self._prefix_len}, _idx={self._idx}, total={total}, all_k.shape={all_k.shape}")
             all_k[..., :self._prefix_len, :] = self._k_prefix[..., self._idx - self._prefix_len : self._idx, :]
             all_v[..., :self._prefix_len, :] = self._v_prefix[..., self._idx - self._prefix_len : self._idx, :]
 
@@ -982,8 +989,13 @@ class BatchTurboQuantKVCache:
         return True
 
     def trim(self, n):
+        import os
+        if os.environ.get('TQ_DEBUG'):
+            print(f"[TQ-DEBUG] trim: n={n}, _idx={self._idx}, _prefix_len={self._prefix_len}")
         n = min(self._idx, n)
         self._idx -= n
+        if os.environ.get('TQ_DEBUG'):
+            print(f"[TQ-DEBUG] trim after: _idx={self._idx}, _prefix_len={self._prefix_len}")
         return n
 
     def make_mask(self, *args, **kwargs):
