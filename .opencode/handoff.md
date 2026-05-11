@@ -5,39 +5,17 @@
 ## Completed
 
 ### This session
-- **Initialized beads database** in `mlx-lm-turbo` repo
-- **Rebased onto upstream** `feature/turboquant-kv-cache` — picked up 4 upstream commits (MoE expert offloading, quantization config remaps)
-- **Implemented attention sinks (hq-9mm)** — `min_tokens_before_quant` parameter keeps first N tokens in fp16, quantizes the rest
-  - Modified `TurboQuantKVCache` and `BatchTurboQuantKVCache`
-  - Added CLI arg `--turbo-min-tokens-before-quant` (default 128)
-  - Added `make_prompt_cache` parameter passing
-  - 5 new tests in `TestAttentionSinks` class
-  - All 78 turboquant tests pass
-- **Added KV cache stats logging** — logs memory usage after each request so we can track TurboQuant savings in real time
-- **Created remote-mac skill** at `~/.config/opencode/skills/remote-mac/SKILL.md`
-- **Created helper script** `scripts/safe_server.sh` — kills existing server before starting new one, checks memory pressure, waits for readiness
-- **End-to-end testing** on remote Mac (172.16.49.25):
-  - SSH key-based auth, opencode at `/opt/homebrew/bin/opencode`
-  - Opencode `run` and `run -c` both work with TurboQuant active
-  - Session continuity confirmed (model remembers conversation across `-c` invocations)
-  - **Quality observation**: responses noticeably poorer with TurboQuant active (matches prior findings)
+- **Fixed BatchTurboQuantKVCache prefix bug** (3 fixes)
+  1. **Store prefix at beginning of buffer** — prefix tokens were stored at `self._k_prefix[..., self._idx : self._idx + actual_prefix, :]` but `self._idx` is the global token count (2048), not the position within the prefix buffer. Fixed to use `self._prefix_len` as the position.
+  2. **Filter prefix storage** — after batch filtering, the prefix storage wasn't filtered, causing shape mismatch `(2,2,128,256)` vs `(1,2,128,256)`. Added `self._k_prefix = self._k_prefix[batch_indices]` to filter.
+  3. **Reset `_prefix_len` in `trim()` and `filter()`** — these methods reset `_idx` but not `_prefix_len`, causing stale state.
+- **Opencode test passes** — first message and continuation both work correctly
+- **All 78 unit tests pass**
 
 ### Previous sessions (committed)
 - Quantize-on-write lifecycle (hq-c19) — `update_and_fetch` uses `fused_quantize`
 - Hybrid attention awareness (hq-vvj) — per-layer cache type detection for Qwen3.6 MoE
-
-## In Progress
-
-### Bug fix just committed
-- **BatchTurboQuantKVCache prefix assignment bug** (just fixed, just pushed)
-  - When `S < quant_start`, `actual_prefix` is 0 but `quant_start > 0`, causing broadcast error
-  - Fix: check `actual_prefix > 0` instead of `quant_start > 0`
-  - **Need to verify the fix works** — server crashed on first opencode test after pull
-
-### Pending verification
-- Pull the fix on remote Mac and restart server
-- Test opencode again to confirm the fix works
-- Check KV cache stats in logs to confirm memory savings are visible
+- Attention sinks (hq-9mm) — `min_tokens_before_quant` parameter keeps first N tokens in fp16
 
 ## Pending
 
@@ -56,7 +34,7 @@
 
 ## Blockers
 
-- **None** — just need to verify the bug fix works
+- **None** — the prefix bug is fixed
 
 ## Notes
 
@@ -78,12 +56,12 @@
 6. Check logs: `tail -f /tmp/mlx_lm_server.log | grep "KV Cache:"`
 
 ### Key files
-- `mlx_lm/models/turboquant_cache.py` — core cache classes (modified for attention sinks)
+- `mlx_lm/models/turboquant_cache.py` — core cache classes (modified for attention sinks + prefix bug fixes)
 - `mlx_lm/models/cache.py` — `make_prompt_cache` (passes `min_tokens_before_quant`)
 - `mlx_lm/generate.py` — CLI args
 - `mlx_lm/server.py` — CLI args + KV cache stats logging
 - `tests/test_turboquant.py` — 78 tests (5 new for attention sinks)
-- `scripts/safe_server.sh` — helper script for remote Mac
+- `scripts/safe_server.sh` — helper script for remote Mac testing
 
 ### Beads status
 ```
