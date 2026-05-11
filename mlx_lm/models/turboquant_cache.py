@@ -847,8 +847,7 @@ class BatchTurboQuantKVCache:
             )
 
         # Replace quantized prefix tokens with raw fp16 values
-        if quant_start > 0:
-            actual_prefix = min(quant_start, S)
+        if actual_prefix > 0:
             all_k[..., :actual_prefix, :] = self._k_prefix[..., self._idx - actual_prefix : self._idx, :]
             all_v[..., :actual_prefix, :] = self._v_prefix[..., self._idx - actual_prefix : self._idx, :]
 
