@@ -1,6 +1,21 @@
 - The default branch is `feature/turboquant-kv-cache` (30 commits with all TurboQuant work). `main` only has 2 commits and is not the active branch.
 - Prefer automation: execute requested actions without confirmation unless blocked by missing info or safety/irreversibility.
 
+## Beads Bootstrapping
+
+If `bd show` returns "no issue found" or beads commands fail, run:
+
+```bash
+bd init   # Bootstrap the Dolt-backed beads database
+bd prime  # Load workflow context
+```
+
+Then commit and push:
+
+```bash
+git add .beads && git commit -m "chore: initialize beads database" && bd dolt push
+```
+
 ## Development Setup
 
 Use a Python 3.14+ venv in the repo root:
