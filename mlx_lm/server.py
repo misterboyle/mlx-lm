@@ -425,10 +425,8 @@ class ModelProvider:
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
-        # TurboQuant KV cache compression is incompatible with batch mode
-        # because TurboQuantKVCache lacks merge/filter/extract/extend methods.
-        # Force single mode when TurboQuant is enabled.
-        if getattr(self.cli_args, "turbo_kv_bits", None) is not None:
+        # Force single mode when explicitly requested
+        if getattr(self.cli_args, "single_mode", None):
             is_batchable = False
 
         # Update the member variables
@@ -2008,6 +2006,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--single-mode",
+        action="store_true",
+        help="Force single-sequence generation mode (no batching). "
+        "Required for cache types that lack merge/filter/extend methods.",
     )
     parser.add_argument(
         "--turbo-kv-bits",
