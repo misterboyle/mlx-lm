@@ -60,17 +60,32 @@ def make_prompt_cache(
     if hasattr(model, "make_cache"):
         default_cache = model.make_cache()
         if turbo_kv_bits is not None:
-            # Check that all layers use a compatible cache type.
-            # Hybrid SSM/attention models (e.g. Qwen3.5) mix ArraysCache
-            # with KVCache; TurboQuant cannot handle non-KV cache layers.
+            from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+            # Per-layer compatibility detection for hybrid/MoE models.
+            # Hybrid SSM/attention models (e.g. Qwen3.5, Qwen3.6) mix
+            # KVCache/ArraysCache/SparseKVCache across layers. Replace only
+            # the standard KVCache/RotatingKVCache layers with TurboQuantKVCache,
+            # keeping other cache types (ArraysCache, SparseKVCache, etc.) as-is.
+            num_layers = len(default_cache)
+            quantized = []
+            quantized_count = 0
+            skipped_count = 0
+
             for i, c in enumerate(default_cache):
-                if not isinstance(c, (KVCache, RotatingKVCache)):
-                    raise ValueError(
-                        f"[TurboQuant] Incompatible cache type in layer {i}: "
-                        f"{type(c).__name__}. "
-                        f"TurboQuant only works with standard multi-head "
-                        f"attention (KVCache/RotatingKVCache)."
+                if isinstance(c, (KVCache, RotatingKVCache)):
+                    # Standard attention cache — replace with TurboQuant
+                    quantized.append(
+                        TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits)
                     )
+                    quantized_count += 1
+                else:
+                    # Non-standard cache (ArraysCache, SparseKVCache, etc.)
+                    # — keep as-is; TurboQuant is not applicable
+                    quantized.append(c)
+                    skipped_count += 1
+
+            return quantized
         else:
             return default_cache
 
