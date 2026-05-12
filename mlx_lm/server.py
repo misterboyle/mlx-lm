@@ -428,7 +428,7 @@ class ModelProvider:
         # TurboQuant KV cache compression is incompatible with batch mode
         # because TurboQuantKVCache lacks merge/filter/extract/extend methods.
         # Force single mode when TurboQuant is enabled.
-        if getattr(cli_args, "turbo_kv_bits", None) is not None:
+        if getattr(self.cli_args, "turbo_kv_bits", None) is not None:
             is_batchable = False
 
         # Update the member variables
