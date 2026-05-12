@@ -314,6 +314,28 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.allclose(old_cache[0].keys[..., 10:11, :], y))
         self.assertTrue(mx.allclose(cache[0].keys[..., 10:11, :], z))
 
+    def test_turboquant_cache_deepcopy(self):
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+        cache = [TurboQuantKVCache(bits=3)]
+
+        x = mx.random.uniform(shape=(1, 8, 10, 4))
+        cache[0].update_and_fetch(x, x)
+
+        # Should not raise TypeError: cannot pickle 'mlx.core.Dtype' object
+        old_cache = copy.deepcopy(cache)
+
+        # Verify the copy is independent
+        self.assertEqual(old_cache[0].offset, cache[0].offset)
+        self.assertEqual(old_cache[0]._dtype_str, cache[0]._dtype_str)
+
+        z = mx.random.uniform(shape=(1, 8, 1, 4))
+        cache[0].update_and_fetch(z, z)
+
+        # Original should have grown, copy should not
+        self.assertEqual(cache[0].offset, 11)
+        self.assertEqual(old_cache[0].offset, 10)
+
     def test_save_load_quantized_cache(self):
         cache = [QuantizedKVCache(bits=4, group_size=32) for _ in range(4)]
         for c in cache:

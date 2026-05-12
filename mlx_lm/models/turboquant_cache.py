@@ -84,7 +84,7 @@ class TurboQuantKVCache:
         self._v_dim = None
         self._k_pdim = None
         self._v_pdim = None
-        self._dtype = None
+        self._dtype_str = None  # stored as string to avoid mx.Dtype deepcopy issues
 
     def _ensure_quantizer(self, k_dim, v_dim):
         if self._k_q is None:
@@ -163,7 +163,7 @@ class TurboQuantKVCache:
     def update_and_fetch(self, keys, values):
         B, H, S, k_dim = keys.shape
         v_dim = values.shape[3]
-        self._dtype = keys.dtype
+        self._dtype_str = self._DTYPE_NAME.get(keys.dtype, "float16")
         self._ensure_quantizer(k_dim, v_dim)
         self._ensure_storage(B, H, S)
         prev = self.offset
@@ -275,7 +275,7 @@ class TurboQuantKVCache:
 
     @property
     def meta_state(self):
-        dtype_str = self._DTYPE_NAME.get(self._dtype, "float16")
+        dtype_str = self._dtype_str or "float16"
         v_bits_str = str(self.v_bits) if self.v_bits is not None else "0"
         return f"{self.offset},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str}"
 
@@ -286,9 +286,9 @@ class TurboQuantKVCache:
         self._k_dim = int(parts[3]) or None
         self._v_dim = int(parts[4]) or None
         if len(parts) > 5:
-            self._dtype = self._DTYPE_MAP.get(parts[5], mx.float16)
+            self._dtype_str = parts[5]
         else:
-            self._dtype = mx.float16
+            self._dtype_str = "float16"
         if len(parts) > 6:
             vb = int(parts[6])
             self.v_bits = vb if vb > 0 else None
@@ -300,7 +300,7 @@ class TurboQuantKVCache:
         if self.k_packed is None:
             return None, None
         B, H = self.k_packed.shape[:2]
-        dtype = self._dtype if self._dtype is not None else mx.float16
+        dtype = self._DTYPE_MAP.get(self._dtype_str, mx.float16) if self._dtype_str else mx.float16
         self._ensure_quantizer(self._k_dim, self._v_dim)
         k = self._full_dequant(self.k_packed, self.k_norms, self._k_q,
                                self._k_dim, B, H, self.offset, dtype)
@@ -360,7 +360,7 @@ class TurboQuantKVCache:
         obj._v_dim = None
         obj._k_pdim = None
         obj._v_pdim = None
-        obj._dtype = None
+        obj._dtype_str = None
         obj.v_bits = None
         obj.v_group_size = 64
         obj.meta_state = meta_state
