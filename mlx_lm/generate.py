@@ -1557,6 +1557,9 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        turbo_kv_bits: Optional[int] = None,
+        turbo_fp16_layers: int = 1,
+        turbo_v_bits: Optional[int] = None,
         stream=None,
     ):
         self.model = model
@@ -1568,6 +1571,9 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.turbo_kv_bits = turbo_kv_bits
+        self.turbo_fp16_layers = turbo_fp16_layers
+        self.turbo_v_bits = turbo_v_bits
 
         self._stream = stream or generation_stream
 
@@ -1705,7 +1711,12 @@ class BatchGenerator:
 
     def _make_new_cache(self):
         if self.max_kv_size is None:
-            return cache.make_prompt_cache(self.model)
+            return cache.make_prompt_cache(
+                self.model,
+                turbo_kv_bits=self.turbo_kv_bits,
+                turbo_fp16_layers=self.turbo_fp16_layers,
+                turbo_v_bits=self.turbo_v_bits,
+            )
 
         return [
             (
@@ -1713,7 +1724,12 @@ class BatchGenerator:
                 if isinstance(ci, KVCache)
                 else ci
             )
-            for ci in cache.make_prompt_cache(self.model)
+            for ci in cache.make_prompt_cache(
+                self.model,
+                turbo_kv_bits=self.turbo_kv_bits,
+                turbo_fp16_layers=self.turbo_fp16_layers,
+                turbo_v_bits=self.turbo_v_bits,
+            )
         ]
 
     def _find_uids(self, uids):

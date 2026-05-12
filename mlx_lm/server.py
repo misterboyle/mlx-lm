@@ -822,6 +822,12 @@ class ResponseGenerator:
                     )
 
                     self._log_cache_stats()
+                    logging.info(
+                        f"[TURBO] BATCH CALL SITE: self._turbo_kv_bits={self._turbo_kv_bits} "
+                        f"(type={type(self._turbo_kv_bits).__name__}), "
+                        f"self._turbo_fp16_layers={self._turbo_fp16_layers}, "
+                        f"self._turbo_v_bits={self._turbo_v_bits}"
+                    )
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
@@ -854,6 +860,9 @@ class ResponseGenerator:
                         logits_processors=[_make_logits_processors(args)],
                         state_machines=[sm],
                     )
+                    # Log cache info after insert_segments (cache may have been created)
+                    if cache is None:
+                        self._log_kv_cache_info(batch_generator._unprocessed_sequences[-1][3])
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
@@ -896,6 +905,9 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         stream=generation_stream,
+                        turbo_kv_bits=self._turbo_kv_bits,
+                        turbo_fp16_layers=self._turbo_fp16_layers,
+                        turbo_v_bits=self._turbo_v_bits,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
