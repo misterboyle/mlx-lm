@@ -72,8 +72,29 @@ def make_prompt_cache(
             quantized_count = 0
             skipped_count = 0
 
+            # Find the first and last attention layers (KVCache type)
+            # to apply FP16 guard around them, not around arbitrary layer indices.
+            # In hybrid models the first layers may be SSM (ArraysCache), so
+            # protecting layer 0 would protect the wrong thing.
+            attention_indices = [
+                i for i, c in enumerate(default_cache)
+                if isinstance(c, (KVCache, RotatingKVCache))
+            ]
+            if attention_indices:
+                first_attn = attention_indices[0]
+                last_attn = attention_indices[-1]
+            else:
+                # No standard attention layers found — fall back to layer indices
+                first_attn = 0
+                last_attn = num_layers - 1
+
             for i, c in enumerate(default_cache):
-                if isinstance(c, (KVCache, RotatingKVCache)):
+                if (first_attn <= i <= first_attn + turbo_fp16_layers - 1) or \
+                   (last_attn - turbo_fp16_layers + 1 <= i <= last_attn):
+                    # FP16 guard layer — keep original cache type
+                    quantized.append(c)
+                    skipped_count += 1
+                elif isinstance(c, (KVCache, RotatingKVCache)):
                     # Standard attention cache — replace with TurboQuant
                     quantized.append(
                         TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits)

@@ -425,6 +425,12 @@ class ModelProvider:
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
+        # TurboQuant KV cache compression is incompatible with batch mode
+        # because TurboQuantKVCache lacks merge/filter/extract/extend methods.
+        # Force single mode when TurboQuant is enabled.
+        if getattr(cli_args, "turbo_kv_bits", None) is not None:
+            is_batchable = False
+
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
