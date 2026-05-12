@@ -468,6 +468,16 @@ class ResponseGenerator:
         self._turbo_v_bits = getattr(
             model_provider.cli_args, "turbo_v_bits", None
         )
+        logging.info(
+            f"[TURBO] ResponseGenerator initialized: "
+            f"turbo_kv_bits={self._turbo_kv_bits} (type={type(self._turbo_kv_bits).__name__}), "
+            f"turbo_fp16_layers={self._turbo_fp16_layers}, "
+            f"turbo_v_bits={self._turbo_v_bits}"
+        )
+        logging.info(
+            f"[TURBO] model_provider.cli_args type={type(model_provider.cli_args).__name__}, "
+            f"all attrs: {[a for a in dir(model_provider.cli_args) if not a.startswith('_')]}"
+        )
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -493,6 +503,43 @@ class ResponseGenerator:
             logging.info(
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
             )
+
+    def _log_kv_cache_info(self, cache):
+        """Log per-layer KV cache type and memory breakdown."""
+        if not cache:
+            return
+
+        layer_types = {}
+        for i, c in enumerate(cache):
+            name = type(c).__name__
+            if name not in layer_types:
+                layer_types[name] = {"count": 0, "indices": [], "nbytes": 0}
+            layer_types[name]["count"] += 1
+            layer_types[name]["indices"].append(i)
+            try:
+                layer_types[name]["nbytes"] += c.nbytes
+            except Exception:
+                pass
+
+        total_bytes = sum(v["nbytes"] for v in layer_types.values())
+        total_gb = total_bytes / 1e9
+
+        logging.info("=" * 60)
+        logging.info("KV Cache — Per-Layer Breakdown")
+        logging.info(f"  Total layers: {len(cache)}")
+        for name, info in sorted(layer_types.items(), key=lambda x: -x[1]["count"]):
+            gb = info["nbytes"] / 1e9
+            indices_str = ", ".join(str(i) for i in info["indices"][:5])
+            if len(info["indices"]) > 5:
+                indices_str += f" ... (+{len(info['indices']) - 5} more)"
+            logging.info(
+                f"    {name:30s}  {info['count']:3d} layers  "
+                f"[{indices_str}]  {gb:.3f} GB ({info['nbytes'] / 1024 / 1024:.0f} MB)"
+            )
+        logging.info(
+            f"  Total KV cache memory: {total_gb:.3f} GB ({total_bytes / 1024 / 1024:.0f} MB)"
+        )
+        logging.info("=" * 60)
 
     def _next_request(self, timeout=None):
         request = None
@@ -993,6 +1040,12 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
+                logging.info(
+                    f"[TURBO] CALL SITE: self._turbo_kv_bits={self._turbo_kv_bits} "
+                    f"(type={type(self._turbo_kv_bits).__name__}), "
+                    f"self._turbo_fp16_layers={self._turbo_fp16_layers}, "
+                    f"self._turbo_v_bits={self._turbo_v_bits}"
+                )
                 cache = make_prompt_cache(
                     self.model_provider.model,
                     turbo_kv_bits=self._turbo_kv_bits,
@@ -1001,6 +1054,7 @@ class ResponseGenerator:
                 )
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+                self._log_kv_cache_info(cache)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
