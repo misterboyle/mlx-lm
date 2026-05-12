@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+import logging
 import copy
 from collections import deque
 from dataclasses import dataclass
@@ -10,6 +11,55 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
+
+logger = logging.getLogger(__name__)
+
+
+def _log_cache_stats(caches, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits):
+    """Log KV cache type breakdown and memory estimates."""
+    if not caches:
+        return
+
+    layer_types = {}
+    for i, c in enumerate(caches):
+        name = type(c).__name__
+        if name not in layer_types:
+            layer_types[name] = {"count": 0, "indices": [], "nbytes": 0}
+        layer_types[name]["count"] += 1
+        layer_types[name]["indices"].append(i)
+        try:
+            layer_types[name]["nbytes"] += c.nbytes
+        except Exception:
+            pass
+
+    total_bytes = sum(v["nbytes"] for v in layer_types.values())
+    total_gb = total_bytes / 1e9
+
+    logger.info("=" * 60)
+    logger.info("KV Cache Configuration")
+    logger.info(f"  Total layers: {len(caches)}")
+    if turbo_kv_bits is not None:
+        logger.info(f"  TurboQuant: {turbo_kv_bits}-bit (PolarQuant)")
+        if turbo_v_bits is not None:
+            logger.info(f"  Value quantization: {turbo_v_bits}-bit (affine)")
+        logger.info(
+            f"  FP16 guard layers: {turbo_fp16_layers} first + {turbo_fp16_layers} last"
+        )
+    logger.info("")
+    logger.info("  Layer breakdown:")
+    for name, info in sorted(layer_types.items(), key=lambda x: -x[1]["count"]):
+        gb = info["nbytes"] / 1e9
+        indices_str = ", ".join(str(i) for i in info["indices"][:5])
+        if len(info["indices"]) > 5:
+            indices_str += f" ... (+{len(info['indices']) - 5} more)"
+        logger.info(
+            f"    {name:25s}  {info['count']:3d} layers  "
+            f"[{indices_str}]  {gb:.3f} GB ({info['nbytes'] / 1024 / 1024:.0f} MB)"
+        )
+    logger.info(
+        f"  Total estimated cache: {total_gb:.3f} GB ({total_bytes / 1024 / 1024:.0f} MB)"
+    )
+    logger.info("=" * 60)
 
 
 def make_prompt_cache(
@@ -60,17 +110,38 @@ def make_prompt_cache(
     if hasattr(model, "make_cache"):
         default_cache = model.make_cache()
         if turbo_kv_bits is not None:
-            # Check that all layers use a compatible cache type.
-            # Hybrid SSM/attention models (e.g. Qwen3.5) mix ArraysCache
-            # with KVCache; TurboQuant cannot handle non-KV cache layers.
+            from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+
+            # Per-layer compatibility detection for hybrid/MoE models.
+            # Hybrid SSM/attention models (e.g. Qwen3.5, Step3.5) mix
+            # KVCache/ArraysCache/SparseKVCache across layers. Replace only
+            # the standard KVCache/RotatingKVCache layers with TurboQuantKVCache,
+            # keeping other cache types (ArraysCache, SparseKVCache, etc.) as-is.
+            num_layers = len(default_cache)
+            quantized = []
             for i, c in enumerate(default_cache):
-                if not isinstance(c, (KVCache, RotatingKVCache)):
-                    raise ValueError(
-                        f"[TurboQuant] Incompatible cache type in layer {i}: "
-                        f"{type(c).__name__}. "
-                        f"TurboQuant only works with standard multi-head "
-                        f"attention (KVCache/RotatingKVCache)."
+                if i < turbo_fp16_layers or i >= num_layers - turbo_fp16_layers:
+                    # FP16 guard layer — keep original cache type
+                    quantized.append(c)
+                elif isinstance(c, (KVCache, RotatingKVCache)):
+                    # Standard attention cache — replace with TurboQuant
+                    quantized.append(
+                        TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits)
                     )
+                else:
+                    # Non-standard cache (ArraysCache, SparseKVCache, etc.)
+                    # — keep as-is; TurboQuant is not applicable
+                    quantized.append(c)
+
+            _log_cache_stats(quantized, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits)
+            logger.info(
+                f"[TURBO] {len(quantized)} caches: "
+                f"{sum(1 for c in quantized if type(c).__name__ == 'TurboQuantKVCache')} "
+                f"TurboQuantKVCache + "
+                f"{sum(1 for c in quantized if type(c).__name__ != 'TurboQuantKVCache')} "
+                f"other (types={[type(c).__name__ for c in quantized]})"
+            )
+            return quantized
         else:
             return default_cache
 
@@ -85,6 +156,15 @@ def make_prompt_cache(
                 caches.append(KVCache())
             else:
                 caches.append(TurboQuantKVCache(bits=turbo_kv_bits, v_bits=turbo_v_bits))
+
+        _log_cache_stats(caches, turbo_kv_bits, turbo_fp16_layers, turbo_v_bits)
+        logger.info(
+            f"[TURBO] {len(caches)} caches: "
+            f"{sum(1 for c in caches if type(c).__name__ == 'TurboQuantKVCache')} "
+            f"TurboQuantKVCache + "
+            f"{sum(1 for c in caches if type(c).__name__ != 'TurboQuantKVCache')} "
+            f"other (types={[type(c).__name__ for c in caches]})"
+        )
         return caches
 
     if max_kv_size is not None:
