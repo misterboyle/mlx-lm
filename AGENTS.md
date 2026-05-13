@@ -83,6 +83,56 @@ bd close <id>         # Complete work
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
 
+## Git Workflow
+
+### Branch Model
+
+```
+main          — release branch, tracks origin/main
+dev           — main development branch, tracks origin/dev
+hq-<bead-id>  — feature branches named after beads, track origin/hq-<bead-id>
+upstream/feature/turboquant-kv-cache — read-only mirror of upstream dev
+official/main — read-only mirror of official mlx-lm
+```
+
+### Rules
+
+- **Working branches always track `origin/`** — never track upstream/official remotes directly. This prevents accidental pushes to the wrong remote.
+- **Read-only mirrors** (`upstream/feature/turboquant-kv-cache`, `official/main`) are local branches that track their respective remotes. You can `git checkout` them to inspect or compare, but never push.
+- **Feature branches are named after beads**: `hq-554-baseline`, `hq-9qj`, etc.
+- **Development flow**: create feature branch from `dev` → work → push to `origin/hq-<bead>` → merge back to `dev` → merge `dev` into `main` for releases.
+- **Rebase upstream changes onto `dev`**, not `main`. Use `git fetch upstream && git rebase upstream/feature/turboquant-kv-cache dev`.
+- **Releases**: merge `dev` into `main` with a merge commit (`--no-ff`), tag with semver (`v0.1.0`), push both `main` and tags.
+
+### Creating a New Feature Branch
+
+```bash
+git checkout dev
+git pull origin dev
+git checkout -b hq-<bead-id>
+# ... work ...
+git push -u origin hq-<bead-id>
+```
+
+### Merging Back
+
+```bash
+git checkout dev
+git pull origin dev
+git merge hq-<bead-id> --no-ff -m "Merge hq-<bead-id>: <description>"
+git push origin dev
+```
+
+### Releasing
+
+```bash
+git checkout main
+git pull origin main
+git merge dev --no-ff -m "Merge dev into main — v0.x.0: <description>"
+git tag -a v0.x.0 -m "v0.x.0: <description>"
+git push origin main --tags
+```
+
 - The default branch is `main`. Feature branches (e.g. `feature/turboquant-kv-cache`, `feature/hybrid-model-turboquant`) are used for active development.
 - Prefer automation: execute requested actions without confirmation unless blocked by missing info or safety/irreversibility.
 
