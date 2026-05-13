@@ -482,7 +482,7 @@ def generate_step(
         logging.info(
             f"[generate_step] prompt={total_prompt_tokens} tokens, "
             f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB, "
-            f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+            f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
             f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
         )
         while total_prompt_tokens - prompt_processed_tokens > 1:
@@ -491,7 +491,7 @@ def generate_step(
             logging.info(
                 f"[generate_step] prefill chunk: {n_to_process} tokens "
                 f"(processed {prompt_processed_tokens}/{total_prompt_tokens}), "
-                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+                f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
                 f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
             )
             _model_call(
@@ -516,7 +516,7 @@ def generate_step(
 
         logging.info(
             f"[generate_step] prompt done, switching to decode, "
-            f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+            f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
             f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
         )
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
@@ -527,7 +527,7 @@ def generate_step(
         if n != max_tokens:
             logging.info(
                 f"[generate_step] decode step {n}, "
-                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+                f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
                 f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
             )
             next_y, next_logprobs = _step(y)

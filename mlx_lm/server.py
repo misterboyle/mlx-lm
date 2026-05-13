@@ -1015,7 +1015,7 @@ class ResponseGenerator:
                 f"[serve_single] starting generation: "
                 f"prompt={len(rest)} tokens, "
                 f"cache={ctx.prompt_cache_count} tokens, "
-                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+                f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
                 f"peak={mx.get_peak_memory() / 1e9:.2f} GB, "
                 f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB"
             )
@@ -2084,7 +2084,7 @@ def main():
     def _signal_handler(signum, frame):
         logging.error(
             f"CRASH: Caught signal {signum} (SIGSEGV/SIGABRT/SIGILL). "
-            f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+            f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
             f"peak={mx.get_peak_memory() / 1e9:.2f} GB, "
             f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB"
         )
