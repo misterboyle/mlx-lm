@@ -1923,6 +1923,7 @@ def _run_http_server(
         "it only implements basic security checks."
     )
     logging.info(f"Starting httpd at {host} on port {port}...")
+    logging.info("Server is ready to accept connections.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
