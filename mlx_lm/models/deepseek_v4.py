@@ -1715,6 +1715,7 @@ class Model(nn.Module):
         #   - has `shared_experts.gate_proj` (vs our `shared_experts.w1`)
         is_thump604 = any(
             "hc_attn.base" in k or "hc_ffn.base" in k or "hc_head.base" in k
+            or "attn_hc.base" in k or "ffn_hc.base" in k or "head_hc.base" in k
             or ".e_score_correction_bias" in k
             or ".switch_mlp." in k
             for k in weights
@@ -1828,10 +1829,14 @@ class Model(nn.Module):
 
             # --- Hyper-connection dot notation -> underscore ---
             # hc_attn.base -> hc_attn_base (etc for fn, scale)
-            for hc_prefix in ("hc_attn", "hc_ffn", "hc_head"):
+            # Some uploads use reversed naming (attn_hc.base) -- handle both.
+            for hc_prefix, target in (
+                ("hc_attn", "hc_attn"), ("hc_ffn", "hc_ffn"), ("hc_head", "hc_head"),
+                ("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn"), ("head_hc", "hc_head"),
+            ):
                 for hc_attr in ("base", "fn", "scale"):
                     dot_form = f"{hc_prefix}.{hc_attr}"
-                    underscore_form = f"{hc_prefix}_{hc_attr}"
+                    underscore_form = f"{target}_{hc_attr}"
                     if dot_form in nk:
                         nk = nk.replace(dot_form, underscore_form)
 
