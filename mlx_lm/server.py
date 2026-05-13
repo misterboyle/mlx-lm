@@ -1109,17 +1109,14 @@ class ResponseGenerator:
             # Save the KV cache at segment boundaries in reverse order
             # (longest to shortest) to prevent prefix removal from evicting
             # shorter caches when longer ones are inserted.
-            import logging as _logging
-            import sys as _sys
-            _logging.info(f"DEBUG: segments={len(segments)}, segment_types={segment_types}")
-            _sys.stdout.flush()
             reversed_segments = list(zip(segments[::-1], segment_types[::-1]))
-            _logging.info(f"DEBUG: reversed_segments={len(reversed_segments)}")
-            _sys.stdout.flush()
             token_offset = 0
             for i, (seg, seg_type) in enumerate(reversed_segments):
                 seg_end = len(prompt) - token_offset
-                seg_cache = copy.deepcopy(cache)
+                # Shallow copy each cache object — arrays are immutable after
+                # generation, so sharing them is safe. This avoids deepcopy
+                # which hangs on lazy MLX arrays.
+                seg_cache = [copy.copy(c) for c in cache]
                 trim_prompt_cache(seg_cache, token_offset)
 
                 # For the assistant segment (first in reversed order),
@@ -1129,19 +1126,13 @@ class ResponseGenerator:
                 else:
                     seg_cache_key = prompt[:seg_end]
 
-                _logging.info(f"DEBUG: inserting cache_type={seg_type}, tokens={len(seg_cache_key)}")
-                _sys.stdout.flush()
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,
                     seg_cache_key,
                     seg_cache,
                     cache_type=seg_type,
                 )
-                _logging.info(f"DEBUG: after insert, cache has {len(self.prompt_cache)} sequences")
-                _sys.stdout.flush()
                 token_offset += len(seg)
-            _logging.info(f"DEBUG: done inserting, cache has {len(self.prompt_cache)} sequences")
-            _sys.stdout.flush()
 
         except Exception as e:
             rqueue.put(e)
