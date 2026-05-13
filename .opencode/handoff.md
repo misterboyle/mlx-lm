@@ -1,54 +1,57 @@
-# Handoff: Memory profiling complete, hq-lq1.5 comparison done
+# Handoff: Memory Profiling Task
 
 ## Completed
 
-- **hq-lq1.1** (Memory profiling) — CLOSED. Both Session A and B tested with 3-bit TurboQuant.
-- **hq-lq1.5** (TQ3 vs uncompressed comparison) — Done. Comparison table in task notes.
-- **hq-fka-1** (Debug logging) — Merged to dev. Memory logging in generate.py and signal handlers in server.py.
-- **hq-server-ready-log** — Merged to dev. Server logs "Server is ready to accept connections."
+- Created epic `hq-lq1` (System characterization) and task `hq-lq1.1` (Memory profiling)
+- Task properly linked as child of epic via `--parent` flag
+- Updated task with server configuration details
+- Model quality test skill updated to use `/metrics` endpoint instead of log parsing
 
-## Open Tasks (in hq-lq1 epic)
+## Server Configuration
 
-| Task | Description |
-|------|-------------|
-| **hq-lq1.2** | Model quality testing in batch mode with TurboQuant (depends on batch mode support) |
-| **hq-lq1.3** | Memory profiling with fused FA kernel (hq-0f9) |
-| **hq-lq1.4** | High-frequency metrics polling for transient spike detection |
+- **TurboQuant**: 3-bit KV cache
+- **FP16 layers**: 1 (default)
+- **Mode**: single-mode
+- **Model**: Qwen3.6-35B-A3B-UD-MLX-4bit
 
-## Key Findings from Comparison
-
-- **Cache compression: ~2.3x** — TQ3 cache is 2.3x smaller at turn 8 (2676 MB vs 6172 MB)
-- **Peak memory: similar** — TQ3 peaks at 27.73 GB, uncompressed at 27.44 GB (within 0.3 GB)
-- **Transient spikes: similar** — TQ3 spike 4.11 GB, uncompressed 4.41 GB (within 0.3 GB)
-- **Context retention: both work** — both correctly recall details from turn 5
-
-**Bottom line:** TurboQuant saves disk/RAM cache space but doesn't reduce GPU peak memory. The benefit is allowing larger contexts to fit in available RAM before hitting disk swap.
-
-## What to Do Next
-
-1. Pick up hq-lq1.2, hq-lq1.3, or hq-lq1.4
-2. hq-lq1.4 (high-freq polling) can be done independently — run the metrics endpoint every 100-500ms during generation to capture spike shape
-3. hq-lq1.3 depends on hq-0f9 (fused FA kernel) being implemented first
-4. hq-lq1.2 depends on batch mode TurboQuant support
-
-## Server Config (if needed)
+## Server Start Command
 
 ```bash
-ssh michael@172.16.49.25
 pkill -f mlx_lm.server
 sleep 2
-cd ~/mlx-lm-turbo && git pull origin dev
-> /tmp/mlx_lm_server.log
-source venv/bin/activate
 PYTHONUNBUFFERED=1 nohup python -m mlx_lm.server \
   --model /Users/michael/.localllm/models/Qwen3.6-35B-A3B-UD-MLX-4bit \
   --host 0.0.0.0 --port 8080 \
-  --turbo-kv-bits 3 --single-mode \
-  >> /tmp/mlx_lm_server.log 2>&1 &
+  --turbo-kv-bits 3 \
+  --single-mode \
+  > /tmp/mlx_lm_server.log 2>&1 &
 ```
+
+## What to Do Next
+
+1. **Claim the task**: `bd update hq-lq1.1 --claim`
+2. **Start the server** on the remote Mac with the config above
+3. **Run a multi-turn conversation** (4-8 turns) using opencode
+4. **Capture `/metrics` output** after each turn:
+   ```bash
+   curl -s http://172.16.49.25:8080/metrics | python3 -m json.tool
+   ```
+5. **Record memory data** after each turn:
+   - `mlx.active_memory_bytes` — total MLX memory
+   - `prompt_cache.total_bytes` — cache size
+   - `prompt_cache.total_sequences` — number of cached sequences
+   - `prompt_cache.by_type` — breakdown by type
+6. **Verify cache growth is linear** — no duplicate inserts from the segment cache bug
+7. **Document results** in the task notes
 
 ## Key Files
 
-- `.opencode/skills/model-quality-test/SKILL.md` — Updated metrics capture (includes peak_memory)
-- `mlx_lm/server.py` — Added readiness log, signal handlers, memory logging
-- `mlx_lm/generate.py` — Added memory logging at key points
+- `.opencode/skills/model-quality-test/SKILL.md` — Updated to use `/metrics` endpoint
+- `mlx_lm/server.py` — Fixed segment cache duplicate insert bug (lines 1082-1094)
+
+## Notes
+
+- The segment cache bug was fixed: full cache save moved outside the segment loop to prevent duplicate inserts
+- The `/metrics` endpoint is working and returns structured JSON
+- Use opencode with `-c` flag for continuation turns
+- NO `-c` for first turn (clean slate)
