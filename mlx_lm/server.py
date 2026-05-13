@@ -1050,15 +1050,19 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache at segment boundaries
+            # Save the KV cache at segment boundaries in reverse order
+            # (longest to shortest) to prevent prefix removal from evicting
+            # shorter caches when longer ones are inserted.
+            reversed_segments = list(zip(segments[::-1], segment_types[::-1]))
             token_offset = 0
-            for i, seg in enumerate(segments):
-                seg_end = token_offset + len(seg)
+            for i, (seg, seg_type) in enumerate(reversed_segments):
+                seg_end = len(prompt) - token_offset
                 seg_cache = copy.deepcopy(cache)
-                trim_prompt_cache(seg_cache, len(prompt) - seg_end)
+                trim_prompt_cache(seg_cache, token_offset)
 
-                # For the last segment, include generated tokens in the cache key
-                if i == len(segments) - 1:
+                # For the assistant segment (first in reversed order),
+                # include generated tokens in the cache key
+                if i == 0:
                     seg_cache_key = cache_key
                 else:
                     seg_cache_key = prompt[:seg_end]
@@ -1067,9 +1071,9 @@ class ResponseGenerator:
                     self.model_provider.model_key,
                     seg_cache_key,
                     seg_cache,
-                    cache_type=segment_types[i],
+                    cache_type=seg_type,
                 )
-                token_offset = seg_end
+                token_offset += len(seg)
 
         except Exception as e:
             rqueue.put(e)
