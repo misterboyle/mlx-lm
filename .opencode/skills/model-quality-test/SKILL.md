@@ -146,8 +146,10 @@ echo "=== $(date) ==="
 curl -s http://172.16.49.25:8080/metrics | python3 -c "
 import json, sys
 m = json.load(sys.stdin)
-print(f'MLX active: {m[\"mlx\"][\"active_memory_bytes\"] / 1e9:.2f} GB')
-print(f'Cache: {m[\"prompt_cache\"][\"total_sequences\"]} seq, {m[\"prompt_cache\"][\"total_bytes\"] / 1e6:.1f} MB')
+print(f'Active: {m[\"mlx\"][\"active_memory_bytes\"] / 1e9:.2f} GB')
+print(f'Peak:   {m[\"mlx\"][\"peak_memory_bytes\"] / 1e9:.2f} GB')
+print(f'Spike:  {(m[\"mlx\"][\"peak_memory_bytes\"] - m[\"mlx\"][\"active_memory_bytes\"]) / 1e9:.2f} GB')
+print(f'Cache:  {m[\"prompt_cache\"][\"total_sequences\"]} seq, {m[\"prompt_cache\"][\"total_bytes\"] / 1e6:.1f} MB')
 for k, v in m['prompt_cache']['by_type'].items():
     if v['sequences'] > 0:
         print(f'  {k}: {v[\"sequences\"]} seq, {v[\"bytes\"] / 1e6:.1f} MB')
