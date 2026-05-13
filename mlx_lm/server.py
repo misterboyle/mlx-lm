@@ -6,9 +6,7 @@ import json
 import logging
 import pickle
 import platform
-import signal as signal_module
 import socket
-import sys
 import time
 import uuid
 import warnings
@@ -1009,16 +1007,6 @@ class ResponseGenerator:
                 )
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
-
-            # Log memory state before generation
-            logging.info(
-                f"[serve_single] starting generation: "
-                f"prompt={len(rest)} tokens, "
-                f"cache={ctx.prompt_cache_count} tokens, "
-                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
-                f"peak={mx.get_peak_memory() / 1e9:.2f} GB, "
-                f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB"
-            )
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -2079,24 +2067,6 @@ def main():
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
-
-    # Install signal handlers to catch crashes and log before dying
-    def _signal_handler(signum, frame):
-        logging.error(
-            f"CRASH: Caught signal {signum} (SIGSEGV/SIGABRT/SIGILL). "
-            f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
-            f"peak={mx.get_peak_memory() / 1e9:.2f} GB, "
-            f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB"
-        )
-        sys.stdout.flush()
-        sys.stderr.flush()
-        # Re-raise to get default behavior (core dump)
-        signal_module.signal(signum, signal_module.SIG_DFL)
-        signal_module.raise_signal(signum)
-
-    signal_module.signal(signal_module.SIGSEGV, _signal_handler)
-    signal_module.signal(signal_module.SIGABRT, _signal_handler)
-    signal_module.signal(signal_module.SIGILL, _signal_handler)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
