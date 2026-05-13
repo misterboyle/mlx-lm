@@ -2081,9 +2081,17 @@ def main():
         mx.set_wired_limit(wired_limit)
 
     # Install signal handlers to catch crashes and log before dying
+    # Note: SIGKILL (9) and SIGSTP (19) cannot be caught
+    _SIGNAL_NAMES = {
+        signal_module.SIGSEGV: "SIGSEGV",
+        signal_module.SIGABRT: "SIGABRT",
+        signal_module.SIGILL: "SIGILL",
+    }
+
     def _signal_handler(signum, frame):
+        sig_name = _SIGNAL_NAMES.get(signum, f"signal({signum})")
         logging.error(
-            f"CRASH: Caught signal {signum} (SIGSEGV/SIGABRT/SIGILL). "
+            f"CRASH: Caught {sig_name}. "
             f"allocated={mx.get_active_memory() / 1e9:.2f} GB, "
             f"peak={mx.get_peak_memory() / 1e9:.2f} GB, "
             f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB"
