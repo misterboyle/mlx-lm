@@ -111,13 +111,48 @@ Each turn must complete fully before starting the next. Running them in parallel
 /opt/homebrew/bin/opencode -m mlx-moe//Users/michael/.localllm/models/Qwen3.6-35B-A3B-UD-MLX-4bit run -c "Earlier I asked you about the quantize-on-write lifecycle. Can you tell me again how the norms are stored and what p_dim means?" > /tmp/test_turn8.txt 2>&1
 ```
 
-### Step 3: Capture Cache Sizes
+### Step 3: Capture Memory Stats
+
+Use the `/metrics` endpoint to get proper memory profiling data. This is more reliable than parsing log output.
 
 ```bash
-grep 'Prompt Cache:' /tmp/mlx_lm_server.log
+ssh michael@172.16.49.25
+curl -s http://172.16.49.25:8080/metrics | python3 -m json.tool
 ```
 
-Record cache size after each turn.
+This returns:
+- `mlx.active_memory_bytes` — total MLX memory in use
+- `mlx.cache_memory_bytes` — MLX internal cache
+- `mlx.peak_memory_bytes` — peak memory since startup
+- `prompt_cache.total_sequences` — number of cached sequences
+- `prompt_cache.total_bytes` — total cache size in bytes
+- `prompt_cache.by_type` — breakdown by cache type (assistant, user, system)
+- `model.loaded` — whether model is loaded
+- `model.model_size_bytes` — model weight size
+- `model.draft_model_loaded` — whether draft model is loaded
+- `model.draft_model_size_bytes` — draft model size
+
+Record these after each turn. Compare across configurations to verify:
+1. **Cache compression** — TurboQuant should show smaller `total_bytes` than baseline
+2. **Memory efficiency** — `active_memory_bytes` should be lower with TurboQuant
+3. **Cache growth** — track how `total_sequences` and `total_bytes` grow across turns
+4. **Model size** — verify model is loaded and size matches expectations
+
+For a quick comparison across configs, run this after each test:
+
+```bash
+ssh michael@172.16.49.25
+echo "=== $(date) ==="
+curl -s http://172.16.49.25:8080/metrics | python3 -c "
+import json, sys
+m = json.load(sys.stdin)
+print(f'MLX active: {m[\"mlx\"][\"active_memory_bytes\"] / 1e9:.2f} GB')
+print(f'Cache: {m[\"prompt_cache\"][\"total_sequences\"]} seq, {m[\"prompt_cache\"][\"total_bytes\"] / 1e6:.1f} MB')
+for k, v in m['prompt_cache']['by_type'].items():
+    if v['sequences'] > 0:
+        print(f'  {k}: {v[\"sequences\"]} seq, {v[\"bytes\"] / 1e6:.1f} MB')
+"
+```
 
 ### Step 4: Capture Token Counts
 
@@ -169,12 +204,12 @@ Check each turn file for:
 ## Comparison
 
 Run baseline first, then run same test with TurboQuant enabled. Compare:
-1. Cache sizes (verify compression)
-2. Token counts (ensure comparable context accumulation)
-3. Response quality (side-by-side)
-4. Tool-calling capability (no `ls` hallucinations)
-5. Context retention (turn 8 references turn 5)
-6. Response lengths (character counts should be similar)
+1. **Cache compression** — use `/metrics` to verify `prompt_cache.total_bytes` is smaller with TurboQuant
+2. **Memory efficiency** — compare `mlx.active_memory_bytes` across configs
+3. **Response quality** — side-by-side
+4. **Tool-calling capability** — no `ls` hallucinations
+5. **Context retention** — turn 8 references turn 5
+6. **Response lengths** — character counts should be similar
 
 ## Notes
 
@@ -186,9 +221,10 @@ Run baseline first, then run same test with TurboQuant enabled. Compare:
 - **Restart the server between Session A and Session B** — kill the old server, clear logs, start a fresh server. This clears the KV cache so Session B starts clean.
 - **Restart the server between config tests** (baseline → TQ3 → TQ4) — same procedure. Each config test must start with a clean server.
 - **ALL turns must be run sequentially, one at a time.** Never run multiple turns concurrently — each turn must complete before the next one starts. Parallel execution shares cache state and produces invalid results.
-- **Session A (turns 1-4) is sufficient for comparing KV cache compression.** The cache sizes after turn 4 show whether TurboQuant is actually compressing the KV cache.
+- **Session A (turns 1-4) is sufficient for comparing KV cache compression.** Use the `/metrics` endpoint to verify `prompt_cache.total_bytes` is smaller with TurboQuant.
 - **Session B (turns 5-8) is only needed if you see tool call loops.** Tool call loops can happen even with fp16 KV cache, so they're not a definitive indicator of a TurboQuant regression. If Session B works on the first try, great. If it loops, retry a few times.
 - Server must be running before each test
 - Clear server logs between tests if needed: `> /tmp/mlx_lm_server.log`
 - Each turn takes ~30-60 seconds to complete
 - **Turns 5-8 are the critical test** — this is where TQ divergence manifests
+- Use `curl -s http://localhost:8080/metrics | python3 -m json.tool` to check memory stats at any point
