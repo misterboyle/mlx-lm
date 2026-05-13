@@ -1,13 +1,11 @@
-# Handoff: Memory profiling complete, epic hq-lq1 has 3 pending tasks
+# Handoff: Memory profiling complete, hq-lq1.5 comparison done
 
 ## Completed
 
-- **hq-lq1.1** (Memory profiling) — CLOSED. Both Session A (story) and Session B (coding) tested with 3-bit TurboQuant.
-  - Peak memory: 27.92 GB (4.2 GB transient spike above steady-state 23.68 GB)
-  - Cache growth linear, no duplicate inserts
-  - Context retention verified across all turns
-- **hq-server-ready-log** — Merged to dev. Server now logs "Server is ready to accept connections."
-- **model-quality-test skill** — Updated capture script to include `peak_memory_bytes` and spike calculation
+- **hq-lq1.1** (Memory profiling) — CLOSED. Both Session A and B tested with 3-bit TurboQuant.
+- **hq-lq1.5** (TQ3 vs uncompressed comparison) — Done. Comparison table in task notes.
+- **hq-fka-1** (Debug logging) — Merged to dev. Memory logging in generate.py and signal handlers in server.py.
+- **hq-server-ready-log** — Merged to dev. Server logs "Server is ready to accept connections."
 
 ## Open Tasks (in hq-lq1 epic)
 
@@ -16,6 +14,15 @@
 | **hq-lq1.2** | Model quality testing in batch mode with TurboQuant (depends on batch mode support) |
 | **hq-lq1.3** | Memory profiling with fused FA kernel (hq-0f9) |
 | **hq-lq1.4** | High-frequency metrics polling for transient spike detection |
+
+## Key Findings from Comparison
+
+- **Cache compression: ~2.3x** — TQ3 cache is 2.3x smaller at turn 8 (2676 MB vs 6172 MB)
+- **Peak memory: similar** — TQ3 peaks at 27.73 GB, uncompressed at 27.44 GB (within 0.3 GB)
+- **Transient spikes: similar** — TQ3 spike 4.11 GB, uncompressed 4.41 GB (within 0.3 GB)
+- **Context retention: both work** — both correctly recall details from turn 5
+
+**Bottom line:** TurboQuant saves disk/RAM cache space but doesn't reduce GPU peak memory. The benefit is allowing larger contexts to fit in available RAM before hitting disk swap.
 
 ## What to Do Next
 
@@ -42,5 +49,6 @@ PYTHONUNBUFFERED=1 nohup python -m mlx_lm.server \
 
 ## Key Files
 
-- `.opencode/skills/model-quality-test/SKILL.md` — Updated metrics capture
-- `mlx_lm/server.py` — Added readiness log message
+- `.opencode/skills/model-quality-test/SKILL.md` — Updated metrics capture (includes peak_memory)
+- `mlx_lm/server.py` — Added readiness log, signal handlers, memory logging
+- `mlx_lm/generate.py` — Added memory logging at key points
