@@ -664,5 +664,324 @@ class TestTurboQuantSaveLoad(unittest.TestCase):
         self.assertEqual(metadata, loaded_meta)
 
 
+# ---------------------------------------------------------------------------
+# Value (V) compression via affine quantization (v_bits)
+# ---------------------------------------------------------------------------
+class TestValueCompression(unittest.TestCase):
+    """Tests for the affine value-compression feature (`v_bits`).
+
+    Keys still use PolarQuant rotation; values use standard `mx.quantize` /
+    `mx.dequantize` with per-group scale and bias.
+    """
+
+    # Small dimensions for fast execution.
+    B = 1
+    H = 1  # n_kv
+    S = 16
+    D = 64
+
+    def _random_kv(self, B=None, H=None, S=None, D=None):
+        B = B or self.B
+        H = H or self.H
+        S = S or self.S
+        D = D or self.D
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        return k, v
+
+    def test_v_bits_initialization(self):
+        cache = TurboQuantKVCache(bits=3, v_bits=4)
+        self.assertEqual(cache.quant_bits, 3)
+        self.assertEqual(cache.v_bits, 4)
+        self.assertEqual(cache.v_group_size, 64)
+        self.assertEqual(cache.offset, 0)
+        self.assertTrue(cache.empty())
+        # Affine value buffers start unallocated.
+        self.assertIsNone(cache._v_quant)
+        self.assertIsNone(cache._v_scales)
+        self.assertIsNone(cache._v_biases)
+        # PolarQuant value buffers should remain unused.
+        self.assertIsNone(cache.v_packed)
+        self.assertIsNone(cache.v_norms)
+
+    def test_v_bits_roundtrip(self):
+        """Values dequantized through 4-bit affine should stay close to inputs.
+
+        Checks BOTH cosine similarity (>0.95) AND normalized MSE
+        (mean((v - v_back)**2) / var(v) < 0.1) -- cos-sim alone is too loose
+        because it ignores scale / offset error.
+        """
+        cache = TurboQuantKVCache(bits=3, v_bits=4)
+        k, v = self._random_kv()
+        _, v_ret = cache.update_and_fetch(k, v)
+
+        # Affine value buffers should now be allocated.
+        self.assertIsNotNone(cache._v_quant)
+        self.assertIsNotNone(cache._v_scales)
+        self.assertIsNotNone(cache._v_biases)
+
+        # Cosine similarity per row should be high.
+        v_flat = v.reshape(-1, self.D)
+        vr_flat = v_ret.reshape(-1, self.D)
+        dots = mx.sum(v_flat * vr_flat, axis=-1)
+        norms = mx.linalg.norm(v_flat, axis=-1) * mx.linalg.norm(vr_flat, axis=-1)
+        cos_sim = mx.mean(dots / (norms + 1e-10))
+        mx.eval(cos_sim)
+        self.assertGreater(
+            cos_sim.item(), 0.95, "4-bit affine value cosine similarity too low"
+        )
+
+        # Normalized MSE check (catches scale / offset errors cos-sim misses).
+        diff = (v - v_ret).astype(mx.float32)
+        mse = mx.mean(diff * diff).item()
+        var = mx.var(v.astype(mx.float32)).item()
+        nmse = mse / (var + 1e-12)
+        self.assertLess(
+            nmse, 0.1,
+            f"4-bit affine value normalized MSE too high: {nmse:.4f}",
+        )
+
+    def test_v_bits_does_not_balloon(self):
+        """v_bits=4 affine V storage must beat FP16 V on a representative D.
+
+        At small D, the per-group FP16 scale+bias overhead from mx.quantize
+        can dominate; at the head_dims used in practice (>=128) the 4-bit
+        affine path should comfortably beat FP16 by a margin (>1x).
+        """
+        B, H, S, D = 1, 1, 16, 256  # D large enough so overhead is negligible
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+
+        # 4-bit affine value cache.
+        cache_q = TurboQuantKVCache(bits=3, v_bits=4)
+        cache_q.update_and_fetch(k, v)
+
+        # V-only byte usage.
+        v_bytes_q = (
+            cache_q._v_quant[..., : cache_q.offset, :].nbytes
+            + cache_q._v_scales[..., : cache_q.offset, :].nbytes
+            + cache_q._v_biases[..., : cache_q.offset, :].nbytes
+        )
+        # FP16 V baseline.
+        v_bytes_fp16 = B * H * S * D * 2
+
+        ratio = v_bytes_fp16 / v_bytes_q
+        self.assertGreater(
+            ratio,
+            1.0,
+            f"v_bits=4 V storage must beat FP16 (ratio={ratio:.2f})",
+        )
+        # Overall cache must also be smaller than uncompressed FP16 KV.
+        fp16_kv_bytes = 2 * B * H * S * D * 2  # K + V
+        self.assertLess(cache_q.nbytes, fp16_kv_bytes)
+
+    def test_v_bits_state_roundtrip(self):
+        """state / meta_state roundtrip should preserve all affine-V fields."""
+        cache = TurboQuantKVCache(bits=3, v_bits=4)
+        k, v = self._random_kv()
+        cache.update_and_fetch(k, v)
+
+        state = cache.state
+        meta = cache.meta_state
+
+        # State should contain 5 tensors for affine-V mode (vs 4 for PolarQuant V).
+        self.assertEqual(len(state), 5)
+
+        restored = TurboQuantKVCache.from_state(state, meta)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertEqual(restored.quant_bits, cache.quant_bits)
+        self.assertEqual(restored.seed, cache.seed)
+        self.assertEqual(restored.v_bits, cache.v_bits)
+        self.assertEqual(restored._k_dim, cache._k_dim)
+        self.assertEqual(restored._v_dim, cache._v_dim)
+
+        for s, rs in zip(state, restored.state):
+            self.assertTrue(mx.array_equal(s, rs))
+
+    def test_v_bits_with_different_widths(self):
+        """All supported widths produce valid shapes AND quality is monotonic.
+
+        Cosine similarity at v_bits=8 must be >= v_bits=4 must be >= v_bits=2
+        (more bits = better roundtrip).
+        """
+        # Use a fixed seed so the same V is fed at every bit width.
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(self.B, self.H, self.S, self.D))
+        v = mx.random.normal(shape=(self.B, self.H, self.S, self.D))
+
+        cos_sims = {}
+        for vb in [2, 4, 8]:
+            cache = TurboQuantKVCache(bits=3, v_bits=vb)
+            k_ret, v_ret = cache.update_and_fetch(k, v)
+            self.assertEqual(cache.offset, self.S)
+            self.assertEqual(cache.v_bits, vb)
+            self.assertEqual(k_ret.shape, (self.B, self.H, self.S, self.D))
+            self.assertEqual(v_ret.shape, (self.B, self.H, self.S, self.D))
+            self.assertIsNotNone(cache._v_quant)
+            self.assertIsNotNone(cache._v_scales)
+            self.assertIsNotNone(cache._v_biases)
+
+            v_flat = v.reshape(-1, self.D)
+            vr_flat = v_ret.reshape(-1, self.D)
+            dots = mx.sum(v_flat * vr_flat, axis=-1)
+            norms = (
+                mx.linalg.norm(v_flat, axis=-1)
+                * mx.linalg.norm(vr_flat, axis=-1)
+            )
+            cs = mx.mean(dots / (norms + 1e-10))
+            mx.eval(cs)
+            cos_sims[vb] = cs.item()
+
+        # Monotonicity: 8 >= 4 >= 2. Small slack for FP noise.
+        self.assertGreaterEqual(
+            cos_sims[8], cos_sims[4] - 1e-3,
+            f"cos-sim(v_bits=8)={cos_sims[8]:.4f} < "
+            f"cos-sim(v_bits=4)={cos_sims[4]:.4f}",
+        )
+        self.assertGreaterEqual(
+            cos_sims[4], cos_sims[2] - 1e-3,
+            f"cos-sim(v_bits=4)={cos_sims[4]:.4f} < "
+            f"cos-sim(v_bits=2)={cos_sims[2]:.4f}",
+        )
+        # 8-bit should be very high quality.
+        self.assertGreater(cos_sims[8], 0.99)
+
+    def test_v_bits_via_make_prompt_cache(self):
+        """make_prompt_cache(model, turbo_kv_bits=3, turbo_v_bits=4) wires v_bits through."""
+        from mlx_lm.utils import load
+
+        model, _ = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        cache = make_prompt_cache(
+            model, turbo_kv_bits=3, turbo_v_bits=4, turbo_fp16_layers=1
+        )
+        num_layers = len(model.layers)
+        self.assertEqual(len(cache), num_layers)
+
+        # Find a TurboQuant layer in the middle.
+        middle = cache[len(cache) // 2]
+        self.assertIsInstance(middle, TurboQuantKVCache)
+        self.assertEqual(middle.quant_bits, 3)
+        self.assertEqual(middle.v_bits, 4)
+
+        # Outer FP16 layers are still plain KVCache.
+        self.assertIsInstance(cache[0], KVCache)
+        self.assertIsInstance(cache[-1], KVCache)
+
+    def test_v_bits_sequential_updates(self):
+        """Prefill then several decode steps with v_bits should keep buffers
+        consistent (offset advances, dequantized prefix stays stable)."""
+        cache = TurboQuantKVCache(bits=3, v_bits=4)
+
+        # Prefill 10 tokens.
+        k0 = mx.random.normal(shape=(self.B, self.H, 10, self.D))
+        v0 = mx.random.normal(shape=(self.B, self.H, 10, self.D))
+        _, v_full = cache.update_and_fetch(k0, v0)
+        self.assertEqual(cache.offset, 10)
+        self.assertEqual(v_full.shape, (self.B, self.H, 10, self.D))
+
+        # Append 3 single-token decode steps.
+        for i in range(3):
+            k1 = mx.random.normal(shape=(self.B, self.H, 1, self.D))
+            v1 = mx.random.normal(shape=(self.B, self.H, 1, self.D))
+            _, v_ret = cache.update_and_fetch(k1, v1)
+            self.assertEqual(cache.offset, 11 + i)
+            self.assertEqual(v_ret.shape, (self.B, self.H, 11 + i, self.D))
+            # The first 10 dequantized rows must match the original prefill
+            # output (the underlying _v_quant rows for [0:10] never change).
+            self.assertTrue(
+                mx.allclose(v_full, v_ret[..., :10, :], atol=1e-4),
+                "Prefilled rows changed after decode append",
+            )
+
+    def test_v_bits_trim(self):
+        """trim() must drop the requested rows AND keep the surviving rows
+        consistent with their original quantized state."""
+        cache = TurboQuantKVCache(bits=3, v_bits=4)
+        k, v = self._random_kv(S=20)
+        _, v_full = cache.update_and_fetch(k, v)
+        self.assertEqual(cache.offset, 20)
+
+        # Dequantize the first 15 rows BEFORE trim so we have a ground truth.
+        k_pre, v_pre = cache.dequantize()
+        self.assertEqual(v_pre.shape, (self.B, self.H, 20, self.D))
+        v_pre_15 = v_pre[..., :15, :]
+
+        n = cache.trim(5)
+        self.assertEqual(n, 5)
+        self.assertEqual(cache.offset, 15)
+
+        # Affine V buffers should still be present.
+        self.assertIsNotNone(cache._v_quant)
+        self.assertIsNotNone(cache._v_scales)
+        self.assertIsNotNone(cache._v_biases)
+
+        # Dequantize again and verify the surviving rows match exactly
+        # (the stored uint32/scales/biases for rows [0:15] are unchanged).
+        _, v_post = cache.dequantize()
+        self.assertEqual(v_post.shape, (self.B, self.H, 15, self.D))
+        self.assertTrue(
+            mx.allclose(v_pre_15, v_post, atol=1e-4),
+            "Trim altered the surviving rows",
+        )
+
+    def test_v_bits_asymmetric_kv_dims(self):
+        """K and V may have different head_dims (GQA / latent-attention)."""
+        cache = TurboQuantKVCache(bits=3, v_bits=4)
+        B, H = 1, 1
+        k_dim, v_dim = 128, 64
+        k = mx.random.normal(shape=(B, H, self.S, k_dim))
+        v = mx.random.normal(shape=(B, H, self.S, v_dim))
+        k_ret, v_ret = cache.update_and_fetch(k, v)
+
+        self.assertEqual(k_ret.shape, (B, H, self.S, k_dim))
+        self.assertEqual(v_ret.shape, (B, H, self.S, v_dim))
+        self.assertEqual(cache._k_dim, k_dim)
+        self.assertEqual(cache._v_dim, v_dim)
+        # Affine V is allocated and has the right last dim.
+        self.assertIsNotNone(cache._v_quant)
+        self.assertEqual(cache._v_scales.shape[-1], v_dim // cache.v_group_size)
+        self.assertEqual(cache._v_biases.shape[-1], v_dim // cache.v_group_size)
+
+        # Roundtrip quality on V at v_bits=4.
+        v_flat = v.reshape(-1, v_dim)
+        vr_flat = v_ret.reshape(-1, v_dim)
+        dots = mx.sum(v_flat * vr_flat, axis=-1)
+        norms = (
+            mx.linalg.norm(v_flat, axis=-1)
+            * mx.linalg.norm(vr_flat, axis=-1)
+        )
+        cs = mx.mean(dots / (norms + 1e-10))
+        mx.eval(cs)
+        self.assertGreater(cs.item(), 0.95)
+
+    def test_v_bits_to_turbo_quantized(self):
+        """KVCache.to_turbo_quantized(bits=3, v_bits=4) converts and preserves shape."""
+        kv_cache = KVCache()
+        k, v = self._random_kv()
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turbo_quantized(bits=3, v_bits=4)
+        self.assertIsInstance(tq_cache, TurboQuantKVCache)
+        self.assertEqual(tq_cache.quant_bits, 3)
+        self.assertEqual(tq_cache.v_bits, 4)
+        self.assertEqual(tq_cache.offset, self.S)
+
+        # Affine V buffers should have been populated by the embedded
+        # update_and_fetch call inside to_turbo_quantized.
+        self.assertIsNotNone(tq_cache._v_quant)
+        self.assertIsNotNone(tq_cache._v_scales)
+        self.assertIsNotNone(tq_cache._v_biases)
+
+        # Dequantized output should approximate the original V.
+        _, v_deq = tq_cache.dequantize()
+        v_flat = v.reshape(-1, self.D)
+        vd_flat = v_deq.reshape(-1, self.D)
+        dots = mx.sum(v_flat * vd_flat, axis=-1)
+        norms = mx.linalg.norm(v_flat, axis=-1) * mx.linalg.norm(vd_flat, axis=-1)
+        cos_sim = mx.mean(dots / (norms + 1e-10))
+        mx.eval(cos_sim)
+        self.assertGreater(cos_sim.item(), 0.95)
+
+
 if __name__ == "__main__":
     unittest.main()
