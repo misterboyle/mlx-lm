@@ -52,6 +52,7 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "mimo_v2": "mimo_v2_flash",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -345,6 +346,24 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    # Remap quantization config keys to match sanitized weight paths.
+    # Models like DeepSeek V4 remap weight names in sanitize() (e.g.
+    # switch_mlp -> experts), so per-layer quantization config must match.
+    if "quantization" in config:
+        q = config["quantization"]
+        remap = {}
+        for qk in list(q.keys()):
+            if not isinstance(q[qk], dict):
+                continue
+            nk = qk
+            nk = nk.replace(".switch_mlp.", ".experts.")
+            nk = nk.replace(".shared_experts.gate_proj", ".shared_experts.w1")
+            nk = nk.replace(".shared_experts.up_proj", ".shared_experts.w3")
+            nk = nk.replace(".shared_experts.down_proj", ".shared_experts.w2")
+            if nk != qk:
+                remap[nk] = q[qk]
+        q.update(remap)
+
     def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
@@ -507,6 +526,8 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
+    *,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -571,7 +592,7 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        {"trust_remote_code": True},
+        tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)
