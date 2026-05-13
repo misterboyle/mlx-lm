@@ -1110,31 +1110,30 @@ class ResponseGenerator:
             # Save the KV cache at segment boundaries in reverse order
             # (longest to shortest) to prevent prefix removal from evicting
             # shorter caches when longer ones are inserted.
-            try:
-                reversed_segments = list(zip(segments[::-1], segment_types[::-1]))
-                token_offset = 0
-                for i, (seg, seg_type) in enumerate(reversed_segments):
-                    seg_end = len(prompt) - token_offset
-                    # Shallow copy each cache object — arrays are immutable after
-                    # generation, so sharing them is safe. This avoids deepcopy
-                    # which hangs on lazy MLX arrays.
-                    seg_cache = [copy.copy(c) for c in cache]
-                    trim_prompt_cache(seg_cache, token_offset)
+            reversed_segments = list(zip(segments[::-1], segment_types[::-1]))
+            token_offset = 0
+            for i, (seg, seg_type) in enumerate(reversed_segments):
+                seg_end = len(prompt) - token_offset
+                # Shallow copy each cache object — arrays are immutable after
+                # generation, so sharing them is safe. This avoids deepcopy
+                # which hangs on lazy MLX arrays.
+                seg_cache = [copy.copy(c) for c in cache]
+                trim_prompt_cache(seg_cache, token_offset)
 
-                    # For the assistant segment (first in reversed order),
-                    # include generated tokens in the cache key
-                    if i == 0:
-                        seg_cache_key = cache_key
-                    else:
-                        seg_cache_key = prompt[:seg_end]
+                # For the assistant segment (first in reversed order),
+                # include generated tokens in the cache key
+                if i == 0:
+                    seg_cache_key = cache_key
+                else:
+                    seg_cache_key = prompt[:seg_end]
 
-                    self.prompt_cache.insert_cache(
-                        self.model_provider.model_key,
-                        seg_cache_key,
-                        seg_cache,
-                        cache_type=seg_type,
-                    )
-                    token_offset += len(seg)
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    seg_cache_key,
+                    seg_cache,
+                    cache_type=seg_type,
+                )
+                token_offset += len(seg)
 
                 # Save the full conversation cache (prompt + assistant) for
                 # longest-prefix matches on follow-up requests. Matches the
@@ -1149,10 +1148,6 @@ class ResponseGenerator:
                 )
 
                 logging.info(f"Saved {len(segments)} segment caches + full cache")
-            except Exception as e:
-                logging.error(f"Failed to save segment caches: {e}")
-                import traceback
-                traceback.print_exc()
 
         except Exception as e:
             rqueue.put(e)
