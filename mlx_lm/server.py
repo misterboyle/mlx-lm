@@ -1698,6 +1698,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
+        elif self.path == "/metrics":
+            self.handle_metrics_request()
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1768,6 +1770,73 @@ class APIHandler(BaseHTTPRequestHandler):
         response = {"object": "list", "data": models}
 
         response_json = json.dumps(response).encode()
+        self.wfile.write(response_json)
+        self.wfile.flush()
+
+    def handle_metrics_request(self):
+        """
+        Handle a GET request for the /metrics endpoint.
+
+        Returns MLX memory stats, prompt cache stats, and model status
+        as JSON for monitoring and debugging.
+        """
+        self._set_completion_headers(200)
+        self.end_headers()
+
+        # MLX memory stats
+        mlx_active = mx.get_active_memory()
+        mlx_cache = mx.get_cache_memory()
+        mlx_peak = mx.get_peak_memory()
+
+        # Prompt cache stats
+        pc = self.response_generator.prompt_cache
+        cache_stats = pc.stats_by_type()
+        prompt_cache_bytes = pc.nbytes
+        prompt_cache_sequences = len(pc)
+
+        # Model status
+        model_loaded = self.response_generator.model_provider.model is not None
+        draft_loaded = self.response_generator.model_provider.draft_model is not None
+
+        # Model size if available
+        model_size = 0
+        if model_loaded:
+            from mlx.utils import tree_flatten
+            model_size = sum(
+                x.nbytes for _, x in tree_flatten(self.response_generator.model_provider.model)
+            )
+
+        # Draft model size if available
+        draft_size = 0
+        if draft_loaded:
+            from mlx.utils import tree_flatten
+            draft_size = sum(
+                x.nbytes for _, x in tree_flatten(self.response_generator.model_provider.draft_model)
+            )
+
+        metrics = {
+            "mlx": {
+                "active_memory_bytes": mlx_active,
+                "cache_memory_bytes": mlx_cache,
+                "peak_memory_bytes": mlx_peak,
+            },
+            "prompt_cache": {
+                "total_sequences": prompt_cache_sequences,
+                "total_bytes": prompt_cache_bytes,
+                "by_type": {
+                    k: {"sequences": v["n_sequences"], "bytes": v["n_bytes"]}
+                    for k, v in cache_stats.items()
+                },
+            },
+            "model": {
+                "loaded": model_loaded,
+                "model_size_bytes": model_size,
+                "draft_model_loaded": draft_loaded,
+                "draft_model_size_bytes": draft_size,
+            },
+        }
+
+        response_json = json.dumps(metrics).encode()
         self.wfile.write(response_json)
         self.wfile.flush()
 
