@@ -21,6 +21,9 @@ from typing import (
     Union,
 )
 
+import logging
+import signal
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
@@ -476,9 +479,21 @@ def generate_step(
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        logging.info(
+            f"[generate_step] prompt={total_prompt_tokens} tokens, "
+            f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB, "
+            f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+            f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
+        )
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
+            logging.info(
+                f"[generate_step] prefill chunk: {n_to_process} tokens "
+                f"(processed {prompt_processed_tokens}/{total_prompt_tokens}), "
+                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+                f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
+            )
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
@@ -499,12 +514,22 @@ def generate_step(
             )
             mx.clear_cache()
 
+        logging.info(
+            f"[generate_step] prompt done, switching to decode, "
+            f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+            f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
+        )
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
     mx.async_eval(y, logprobs)
     n = 0
     while True:
         if n != max_tokens:
+            logging.info(
+                f"[generate_step] decode step {n}, "
+                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+                f"peak={mx.get_peak_memory() / 1e9:.2f} GB"
+            )
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
