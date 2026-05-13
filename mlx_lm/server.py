@@ -41,6 +41,7 @@ from .generate import (
 from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
+    trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -394,7 +395,9 @@ class ModelProvider:
             from .models.expert_offload import enable_expert_offloading
 
             n_layers = enable_expert_offloading(
-                model, model_path, max_resident_experts=max_re,
+                model,
+                model_path,
+                max_resident_experts=max_re,
             )
             if n_layers > 0:
                 logging.info(
@@ -499,15 +502,11 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
-        self._turbo_kv_bits = getattr(
-            model_provider.cli_args, "turbo_kv_bits", None
-        )
+        self._turbo_kv_bits = getattr(model_provider.cli_args, "turbo_kv_bits", None)
         self._turbo_fp16_layers = getattr(
             model_provider.cli_args, "turbo_fp16_layers", 1
         )
-        self._turbo_v_bits = getattr(
-            model_provider.cli_args, "turbo_v_bits", None
-        )
+        self._turbo_v_bits = getattr(model_provider.cli_args, "turbo_v_bits", None)
         self._kv_quant_config = getattr(
             model_provider.cli_args, "kv_quant_config", None
         )
@@ -1014,7 +1013,9 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(
+                tokenizer, request, args
+            )
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -1105,10 +1106,26 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self._store_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            # Save the KV cache at segment boundaries
+            token_offset = 0
+            for i, seg in enumerate(segments):
+                seg_end = token_offset + len(seg)
+                seg_cache = copy.deepcopy(cache)
+                trim_prompt_cache(seg_cache, len(prompt) - seg_end)
+
+                # For the last segment, include generated tokens in the cache key
+                if i == len(segments) - 1:
+                    seg_cache_key = cache_key
+                else:
+                    seg_cache_key = prompt[:seg_end]
+
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    seg_cache_key,
+                    seg_cache,
+                    cache_type=segment_types[i],
+                )
+                token_offset = seg_end
 
         except Exception as e:
             rqueue.put(e)
