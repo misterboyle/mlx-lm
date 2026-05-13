@@ -1066,6 +1066,16 @@ class ResponseGenerator:
                 # path doesn't support quantized cache in generate_step)
                 cache = _maybe_dequantize_cache(cache)
 
+            # Log memory state before generation
+            logging.info(
+                f"[serve_single] starting generation: "
+                f"prompt={len(rest)} tokens, "
+                f"cache={ctx.prompt_cache_count} tokens, "
+                f"allocated={mx.get_allocated_memory() / 1e9:.2f} GB, "
+                f"peak={mx.get_peak_memory() / 1e9:.2f} GB, "
+                f"wired_limit={mx.device_info()['max_recommended_working_set_size'] / 1e9:.1f} GB"
+            )
+
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
