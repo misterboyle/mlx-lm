@@ -1079,7 +1079,20 @@ class ResponseGenerator:
                         cache_type=seg_type,
                     )
                     token_offset += len(seg)
-                logging.info(f"Saved {len(segments)} segment caches")
+
+                # Save the full conversation cache (prompt + assistant) for
+                # longest-prefix matches on follow-up requests. Matches the
+                # batch path at line 932-937.
+                full_cache = [copy.copy(c) for c in cache]
+                full_key = prompt + cache_key
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    full_key,
+                    full_cache,
+                    cache_type="assistant",
+                )
+
+                logging.info(f"Saved {len(segments)} segment caches + full cache")
             except Exception as e:
                 logging.error(f"Failed to save segment caches: {e}")
                 import traceback
