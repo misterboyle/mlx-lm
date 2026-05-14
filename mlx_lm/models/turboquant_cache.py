@@ -725,6 +725,10 @@ class BatchTurboQuantKVCache:
 
         Accounts for per-entry left-padding: each entry's data starts at
         left_padding[i] and has length offset[i].
+
+        Follows the BatchKVCache pattern: dequantize the shared buffer
+        (all entries have the same sequence length _idx) and return
+        k_out[..., : self._idx, :], v_out[..., : self._idx, :].
         """
         B, H = self.k_packed.shape[:2]
         dtype = TurboQuantKVCache._DTYPE_MAP.get(self._dtype_str, mx.float16)
@@ -732,8 +736,9 @@ class BatchTurboQuantKVCache:
         lp = self.left_padding.tolist()
         off = self.offset.tolist()
 
-        # Dequantize keys
-        k_out = mx.zeros((B, H, max(off), self._k_dim), dtype=dtype)
+        # Dequantize keys — use _idx (shared buffer length) not max(off)
+        # to match BatchKVCache/BatchSparseKVCache pattern
+        k_out = mx.zeros((B, H, self._idx, self._k_dim), dtype=dtype)
         for i in range(B):
             start = lp[i]
             length = off[i]
@@ -755,10 +760,9 @@ class BatchTurboQuantKVCache:
                 1, H, length, self._k_dim
             ).astype(dtype)
 
-        # Dequantize values
-        max_v = max(off) if off else 0
+        # Dequantize values — use _idx (shared buffer length) not max(off)
+        v_out = mx.zeros((B, H, self._idx, self._v_dim), dtype=dtype)
         if self.v_bits is not None:
-            v_out = mx.zeros((B, H, max_v, self._v_dim), dtype=dtype)
             for i in range(B):
                 start = lp[i]
                 length = off[i]
@@ -775,7 +779,6 @@ class BatchTurboQuantKVCache:
                     bits=self.v_bits,
                 ).astype(dtype)
         else:
-            v_out = mx.zeros((B, H, max_v, self._v_dim), dtype=dtype)
             for i in range(B):
                 start = lp[i]
                 length = off[i]
