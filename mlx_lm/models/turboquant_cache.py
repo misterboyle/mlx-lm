@@ -537,16 +537,31 @@ class BatchTurboQuantKVCache:
 
     def update_and_fetch(self, keys, values):
         B, H, S, k_dim = keys.shape
+        B, H = int(B), int(H)
         v_dim = values.shape[3]
         self._dtype_str = TurboQuantKVCache._DTYPE_NAME.get(keys.dtype, "float16")
         if self.quant_bits is None:
             self.quant_bits = 3
             self.seed = 42
-        if self._k_dim is None:
+
+        # Regenerate quantizer params from seed when missing (e.g. from_state).
+        # merge() sets these from the individual caches; from_state does not.
+        if self._k_signs is None:
+            k_q = _Quantizer(k_dim, self.quant_bits, self.seed)
+            self._k_signs = k_q.signs
+            self._k_centroids = k_q.centroids
             self._k_dim = k_dim
             self._k_pdim = packed_dim(k_dim, self.quant_bits)
-        if self._v_dim is None:
+        if self._v_signs is None and self.v_bits is None:
+            v_q = _Quantizer(v_dim, self.quant_bits, self.seed + 1)
+            self._v_signs = v_q.signs
+            self._v_centroids = v_q.centroids
             self._v_dim = v_dim
+            self._v_pdim = packed_dim(v_dim, self.quant_bits)
+        elif self._v_dim is None:
+            self._v_dim = v_dim
+            if self._v_pdim is None:
+                self._v_pdim = packed_dim(v_dim, self.quant_bits)
 
         prev = self._idx
         if self.k_packed is None or (prev + S) > self.k_packed.shape[2]:
