@@ -279,7 +279,7 @@ class TestTurboQuantKVCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
 
         state = cache.state
-        self.assertEqual(len(state), 4)  # k_packed, k_norms, v_packed, v_norms
+        self.assertEqual(len(state), 8)  # k_packed, k_norms, v_packed, v_norms, _k_q.signs, _k_q.centroids, _v_q.signs, _v_q.centroids
         self.assertEqual(state[0].shape[2], 10)  # k_packed seq dim
         self.assertEqual(state[1].shape[2], 10)  # k_norms seq dim
 
@@ -775,8 +775,8 @@ class TestValueCompression(unittest.TestCase):
         state = cache.state
         meta = cache.meta_state
 
-        # State should contain 5 tensors for affine-V mode (vs 4 for PolarQuant V).
-        self.assertEqual(len(state), 5)
+        # State should contain 7 tensors for affine-V mode (vs 8 for PolarQuant V).
+        self.assertEqual(len(state), 7)
 
         restored = TurboQuantKVCache.from_state(state, meta)
         self.assertEqual(restored.offset, cache.offset)
@@ -1368,6 +1368,134 @@ class TestBatchTurboQuantKVCache(unittest.TestCase):
         mx.eval(cs_v1)
         self.assertGreater(cs_v1.item(), 0.999)
 
+    # -- from_state → update_and_fetch (server flow) ----------------------
+
+    def test_from_state_then_update(self):
+        """from_state → update_and_fetch must work (server flow).
+
+        This is the path that crashed in production: server loads saved prompt
+        cache via from_state, then calls update_and_fetch for decode tokens.
+        Bug #1: from_state left quantizer params as None.
+        """
+        c1 = self._make_tq_cache(10, seed=12)
+        c2 = self._make_tq_cache(15, seed=13)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        # Serialize
+        state = batch.state
+        meta = batch.meta_state
+
+        # Restore from state (simulates server loading saved cache)
+        restored = BatchTurboQuantKVCache.from_state(state, meta)
+
+        # Now update — this is where the bug was (None quantizer params)
+        B, H, S, D = 2, 4, 1, 64
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+
+        # Should NOT raise AttributeError or crash
+        k_ret, v_ret = restored.update_and_fetch(k, v)
+
+        # Verify offset advanced
+        self.assertEqual(restored._idx, batch._idx + S)
+        self.assertEqual(k_ret.shape, (B, H, restored._idx, D))
+
+    def test_from_state_then_update_affine_v(self):
+        """from_state → update_and_fetch with affine-quantized V (v_bits=4)."""
+        c1 = self._make_tq_cache(10, v_bits=4, seed=12)
+        c2 = self._make_tq_cache(15, v_bits=4, seed=13)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        state = batch.state
+        meta = batch.meta_state
+
+        restored = BatchTurboQuantKVCache.from_state(state, meta)
+
+        B, H, S, D = 2, 4, 1, 64
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+
+        k_ret, v_ret = restored.update_and_fetch(k, v)
+
+        self.assertEqual(restored._idx, batch._idx + S)
+        self.assertEqual(k_ret.shape, (B, H, restored._idx, D))
+
+    def test_from_state_then_update_preserves_quantizer_params(self):
+        """Quantizer params must be present after from_state (not None)."""
+        c1 = self._make_tq_cache(10, seed=12)
+        c2 = self._make_tq_cache(15, seed=13)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        state = batch.state
+        meta = batch.meta_state
+
+        restored = BatchTurboQuantKVCache.from_state(state, meta)
+
+        # Quantizer params must be present (not None)
+        self.assertIsNotNone(restored._k_signs)
+        self.assertIsNotNone(restored._k_centroids)
+        self.assertIsNotNone(restored._v_signs)
+        self.assertIsNotNone(restored._v_centroids)
+
+        # Verify shapes match expected dimensions
+        self.assertEqual(restored._k_signs.shape, (64,))
+        self.assertEqual(restored._k_centroids.shape, (8,))  # 2^3 = 8 for 3-bit
+
+    def test_large_sequence_resize(self):
+        """update_and_fetch must handle sequences that cross step=256 boundary.
+
+        Bug #2: old buffer was over-allocated (e.g. 16384 slots for 16381 used).
+        Copy tried to paste full buffer into smaller slice → broadcast error.
+        """
+        c1 = self._make_tq_cache(100, seed=100)
+        c2 = self._make_tq_cache(100, seed=101)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        # Fill up to step boundary
+        B, H, S, D = 2, 4, 156, 64  # 100 + 156 = 256 (exactly at boundary)
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        k_ret, v_ret = batch.update_and_fetch(k, v)
+
+        # Cross the boundary
+        k2 = mx.random.normal(shape=(B, H, 10, D))
+        v2 = mx.random.normal(shape=(B, H, 10, D))
+        k_ret2, v_ret2 = batch.update_and_fetch(k2, v2)
+
+        # Verify no crash and shapes are correct
+        self.assertEqual(batch._idx, 266)
+        self.assertEqual(k_ret2.shape, (B, H, 266, D))
+
+    def test_merge_from_state_caches(self):
+        """merge() must work when individual caches were loaded via from_state.
+
+        Bug #3: merge() assumed first._k_q is not None, but from_state leaves it None.
+        """
+        c1 = self._make_tq_cache(10, seed=12)
+        c2 = self._make_tq_cache(15, seed=13)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        # Serialize and restore individual caches
+        state1 = c1.state
+        meta1 = c1.meta_state
+        state2 = c2.state
+        meta2 = c2.meta_state
+
+        c1_restored = TurboQuantKVCache.from_state(state1, meta1)
+        c2_restored = TurboQuantKVCache.from_state(state2, meta2)
+
+        # merge should work even though _k_q is None on restored caches
+        batch2 = BatchTurboQuantKVCache.merge([c1_restored, c2_restored])
+
+        # Verify params are present
+        self.assertIsNotNone(batch2._k_signs)
+        self.assertIsNotNone(batch2._k_centroids)
+        self.assertIsNotNone(batch2._v_signs)
+        self.assertIsNotNone(batch2._v_centroids)
+
+        # Verify _idx is correct
+        self.assertEqual(batch2._idx, 15)
+
 
 # 11. BatchTurboQuantKVCache end-to-end with Qwen1.5 model
 # ---------------------------------------------------------------------------
@@ -1567,6 +1695,84 @@ class TestBatchTurboQuantKVCacheModel(unittest.TestCase):
             mx.std(batch0).item(),
             1e-4,
             "Batch entry 0 output has near-zero variance",
+        )
+
+    def test_batch_decode_from_saved_cache(self):
+        """Server flow: save prompt cache, load via from_state, decode tokens.
+
+        This is the exact production flow that crashed:
+        1. Prefill two prompts
+        2. Merge into batched caches
+        3. Serialize (state/meta_state)
+        4. Restore via from_state (simulates load_prompt_cache)
+        5. Run decode tokens — this is where the bug was (None quantizer params)
+        """
+        prompt_a = mx.expand_dims(
+            self.tokenizer.encode(
+                "The quick brown fox jumps over the lazy dog and",
+                return_tensors="mlx",
+            )[0],
+            0,
+        )
+        prompt_b = mx.expand_dims(
+            self.tokenizer.encode(
+                "A quick brown fox jumps over the lazy cat and",
+                return_tensors="mlx",
+            )[0],
+            0,
+        )
+
+        cache_a = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
+        cache_b = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
+
+        _ = self.model(prompt_a, cache=cache_a)
+        _ = self.model(prompt_b, cache=cache_b)
+
+        # Merge into batched caches
+        batched = [ca.merge([ca, cb]) for ca, cb in zip(cache_a, cache_b)]
+
+        # Only serialize/restore BatchTurboQuantKVCache layers (not KVCache/ArraysCache)
+        tq_layers = [c for c in batched if isinstance(c, BatchTurboQuantKVCache)]
+        self.assertGreater(len(tq_layers), 0, "Expected at least one BatchTurboQuantKVCache layer")
+
+        states = [c.state for c in tq_layers]
+        metas = [c.meta_state for c in tq_layers]
+
+        # Restore via from_state (simulates load_prompt_cache)
+        restored = [BatchTurboQuantKVCache.from_state(s, m) for s, m in zip(states, metas)]
+
+        # Verify quantizer params are present (not None)
+        for c in restored:
+            self.assertIsNotNone(c._k_signs)
+            self.assertIsNotNone(c._k_centroids)
+            self.assertIsNotNone(c._v_signs)
+            self.assertIsNotNone(c._v_centroids)
+
+        # Build restored cache list (replace TQ layers, keep others as-is)
+        restored_batched = []
+        tq_idx = 0
+        for c in batched:
+            if isinstance(c, BatchTurboQuantKVCache):
+                restored_batched.append(restored[tq_idx])
+                tq_idx += 1
+            else:
+                restored_batched.append(c)
+
+        # Decode — this is where the bug was (None quantizer params)
+        decode_tok = mx.array(
+            [
+                [self.tokenizer.encode("hello")[0]],
+                [self.tokenizer.encode("world")[0]],
+            ]
+        )
+        out = self.model(decode_tok, cache=restored_batched)
+        mx.eval(out)
+
+        # Verify outputs are finite and differ
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+        self.assertFalse(
+            mx.allclose(out[0:1], out[1:2], atol=1e-3).item(),
+            "Batched entries produced identical outputs after from_state restore",
         )
 
 

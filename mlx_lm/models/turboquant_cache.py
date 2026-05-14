@@ -336,12 +336,18 @@ class TurboQuantKVCache:
                 self._v_quant[..., : self.offset, :],
                 self._v_scales[..., : self.offset, :],
                 self._v_biases[..., : self.offset, :],
+                self._k_q.signs if self._k_q is not None else None,
+                self._k_q.centroids if self._k_q is not None else None,
             ]
         return [
             self.k_packed[..., : self.offset, :],
             self.k_norms[..., : self.offset],
             self.v_packed[..., : self.offset, :],
             self.v_norms[..., : self.offset],
+            self._k_q.signs if self._k_q is not None else None,
+            self._k_q.centroids if self._k_q is not None else None,
+            self._v_q.signs if self._v_q is not None else None,
+            self._v_q.centroids if self._v_q is not None else None,
         ]
 
     @state.setter
@@ -349,15 +355,33 @@ class TurboQuantKVCache:
         if not v:
             return
         if self.v_bits is not None:
-            (
-                self.k_packed,
-                self.k_norms,
-                self._v_quant,
-                self._v_scales,
-                self._v_biases,
-            ) = v
+            # Affine V mode: [k_packed, k_norms, _v_quant, _v_scales, _v_biases,
+            #                 _k_q.signs, _k_q.centroids]
+            self.k_packed = v[0]
+            self.k_norms = v[1]
+            self._v_quant = v[2]
+            self._v_scales = v[3]
+            self._v_biases = v[4]
+            if len(v) > 5 and v[5] is not None:
+                self._k_q = _Quantizer(0, self.quant_bits, 0)
+                self._k_q.signs = v[5]
+                self._k_q.centroids = v[6]
         else:
-            self.k_packed, self.k_norms, self.v_packed, self.v_norms = v
+            # PolarQuant V mode: [k_packed, k_norms, v_packed, v_norms,
+            #                      _k_q.signs, _k_q.centroids,
+            #                      _v_q.signs, _v_q.centroids]
+            self.k_packed = v[0]
+            self.k_norms = v[1]
+            self.v_packed = v[2]
+            self.v_norms = v[3]
+            if len(v) > 4 and v[4] is not None:
+                self._k_q = _Quantizer(0, self.quant_bits, 0)
+                self._k_q.signs = v[4]
+                self._k_q.centroids = v[5]
+            if len(v) > 6 and v[6] is not None:
+                self._v_q = _Quantizer(0, self.quant_bits, 0)
+                self._v_q.signs = v[6]
+                self._v_q.centroids = v[7]
         self.offset = self.k_packed.shape[2]
 
     _DTYPE_MAP = {
@@ -392,6 +416,11 @@ class TurboQuantKVCache:
             self.v_bits = vb if vb > 0 else None
         else:
             self.v_bits = None
+        # Compute packed dimensions from dim + bit width.
+        if self._k_dim is not None:
+            self._k_pdim = packed_dim(self._k_dim, self.quant_bits)
+        if self._v_dim is not None and self.v_bits is None:
+            self._v_pdim = packed_dim(self._v_dim, self.quant_bits)
 
     def dequantize(self):
         """Return full dequantized (keys, values) as dense arrays."""
@@ -1130,6 +1159,11 @@ class BatchTurboQuantKVCache:
             self.v_group_size = int(parts[6])
         else:
             self.v_group_size = 64
+        # Compute packed dimensions from dim + bit width.
+        if self._k_dim is not None:
+            self._k_pdim = packed_dim(self._k_dim, self.quant_bits)
+        if self._v_dim is not None and self.v_bits is None:
+            self._v_pdim = packed_dim(self._v_dim, self.quant_bits)
 
     @classmethod
     def from_state(cls, state, meta_state):
