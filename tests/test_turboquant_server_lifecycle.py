@@ -395,6 +395,10 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
 
         Batching should not add quality degradation on top of quantization.
         The same quantization method should produce similar output regardless of batching.
+
+        Baseline: FP16 single vs FP16 batch similarity is 1.00 (identical output).
+        This confirms that batching itself doesn't affect output — the issue is
+        specific to the interaction between BatchTurboQuantKVCache and BatchGenerator.
         """
         from mlx_lm.generate import batch_generate
 
@@ -408,6 +412,24 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
             messages, tokenize=False, add_generation_prompt=True
         )
         tokens = self.tokenizer.encode(prompt, return_tensors="mlx")[0]
+
+        # --- FP16 single-mode (baseline) ---
+        cache_fp16_single = make_prompt_cache(self.model)
+        results_fp16_single = list(
+            generate_step(tokens, self.model, prompt_cache=cache_fp16_single, max_tokens=200)
+        )
+        toks_fp16_single = [t for t, _ in results_fp16_single]
+        mx.eval(*toks_fp16_single)
+        generated_fp16_single = self.tokenizer.decode(list(toks_fp16_single))
+
+        # --- FP16 batch (baseline) ---
+        response_fp16_batch = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts=[tokens.tolist()],
+            max_tokens=200,
+        )
+        generated_fp16_batch = response_fp16_batch.texts[0]
 
         # --- Single-mode TurboQuant (known good baseline) ---
         cache_single = make_prompt_cache(
@@ -431,21 +453,29 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         )
         generated_batch = response_batch.texts[0]
 
-        # Word similarity
-        single_words = set(generated_single.lower().split())
-        batch_words = set(generated_batch.lower().split())
-        overlap = len(single_words & batch_words)
-        total = len(single_words | batch_words)
-        similarity = overlap / total if total > 0 else 0
+        # Word similarity helper
+        def similarity(a, b):
+            wa = set(a.lower().split())
+            wb = set(b.lower().split())
+            return len(wa & wb) / len(wa | wb) if wa | wb else 0
 
+        # Baseline: FP16 single vs FP16 batch should be 1.00 (identical output)
+        # This confirms that batching itself doesn't affect output
+        fp16_similarity = similarity(generated_fp16_single, generated_fp16_batch)
+        self.assertGreaterEqual(
+            fp16_similarity, 0.99,
+            f"FP16 single vs batch similarity is {fp16_similarity:.2f}. "
+            f"Expected ~1.00 — batching should not affect FP16 output."
+        )
+
+        # TurboQuant: batch must match single-mode to the same degree as FP16
         # Batching should not add quality degradation on top of quantization.
-        # The same quantization method should produce similar output regardless of batching.
-        # A threshold of 0.70 allows for minor stochastic variation but catches
-        # the regression where batch output has a completely different style.
-        self.assertGreater(
-            similarity, 0.70,
+        tq_similarity = similarity(generated_single, generated_batch)
+        self.assertGreaterEqual(
+            tq_similarity, fp16_similarity - 0.01,
             f"Batch+TurboQuant output style differs from single-mode+TurboQuant "
-            f"(similarity={similarity:.2f}). Batch output should match single-mode output style. "
+            f"(similarity={tq_similarity:.2f}). Batch output should match single-mode output style "
+            f"to the same degree as FP16 (similarity={fp16_similarity:.2f}). "
             f"Batching should not add quality degradation on top of quantization."
         )
 
