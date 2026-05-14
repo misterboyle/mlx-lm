@@ -1002,20 +1002,16 @@ class BatchTurboQuantKVCache:
         max_idx = max(self._idx, other._idx)
         L1 = L2 = 0
         if self.k_packed is not None:
-            L1 = self.k_packed.shape[2]
+            L1 = self._idx
         if other.k_packed is not None:
-            L2 = other.k_packed.shape[2]
+            L2 = other._idx
         max_size = max(L1, L2)
 
         def pad_cache(c):
             Bc = c.left_padding.shape[0]
             Hc = c.k_packed.shape[1] if c.k_packed is not None else 0
             left = max_idx - c._idx
-            right = (
-                max_size - c.k_packed.shape[2] - left if c.k_packed is not None else 0
-            )
-            if right < 0:
-                right = 0
+            right = 0  # No right padding needed — we're padding to max_idx
 
             def _pad_4d(arr, left_p, right_p):
                 if arr is None:
@@ -1029,18 +1025,19 @@ class BatchTurboQuantKVCache:
                 pad_widths = [(0, 0), (0, 0), (left_p, right_p)]
                 return mx.pad(arr, pad_widths)
 
-            new_kp = _pad_4d(c.k_packed, left, right)
-            new_kn = _pad_3d(c.k_norms, left, right)
+            # Pad the actual data (up to _idx), not the buffer
+            new_kp = _pad_4d(c.k_packed[..., : c._idx, :], left, right)
+            new_kn = _pad_3d(c.k_norms[..., : c._idx], left, right)
             new_lp = c.left_padding + left
             new_off = c.offset  # offset stays as-is (data length, not padded position)
 
             if c.v_bits is not None:
-                new_vq = _pad_4d(c._v_quant, left, right)
-                new_vs = _pad_4d(c._v_scales, left, right)
-                new_vb = _pad_4d(c._v_biases, left, right)
+                new_vq = _pad_4d(c._v_quant[..., : c._idx, :], left, right)
+                new_vs = _pad_4d(c._v_scales[..., : c._idx, :], left, right)
+                new_vb = _pad_4d(c._v_biases[..., : c._idx, :], left, right)
             else:
-                new_vq = _pad_4d(c.v_packed, left, right)
-                new_vs = _pad_3d(c.v_norms, left, right)
+                new_vq = _pad_4d(c.v_packed[..., : c._idx, :], left, right)
+                new_vs = _pad_3d(c.v_norms[..., : c._idx], left, right)
                 new_vb = None
 
             return new_kp, new_kn, new_vq, new_vs, new_vb, new_lp, new_off
