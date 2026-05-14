@@ -30,10 +30,41 @@ When resizing the buffer, the old buffer was over-allocated (e.g. 16384 slots fo
 
 **Fix:** Truncate the copy to the used portion: `self.k_packed[..., :prev, :]` (matches the pattern already used in the regular `TurboQuantKVCache`).
 
-### 3. Integration tests didn't catch these bugs
+### 3. `merge()` missing quantizer params
+`merge()` assumed `first._k_q` is not None, but when a cache has been loaded via `from_state` (size > 0 from loaded state), `_k_q` is None.
+
+**Fix:** When `first._k_q` is None, regenerate the quantizer from the seed using `_Quantizer` (same approach as the fix in `update_and_fetch`).
+
+### 4. `mx.concatenate` keyword arg issue
+Remote MLX binary has a nanobind binding issue where `axis=` keyword arg is rejected even though `help()` shows it as valid.
+
+**Fix:** Use positional arg instead for compatibility.
+
+### 5. Integration tests didn't catch these bugs
 The integration tests always go through `merge()` first, which copies `_v_pdim` and quantizer params from the individual caches. The server creates fresh `BatchTurboQuantKVCache` instances that haven't been merged yet — they hit `update_and_fetch` with `None` params.
 
 The tests also use small sequences that don't trigger the buffer resize path with over-allocated buffers.
+
+## Live Server Test Results
+
+### Baseline (no TurboQuant)
+| Turn | Active Memory | Cache Size | Cache Seqs |
+|------|--------------|------------|------------|
+| 1    | 23.43 GB     | 1923 MB    | 8          |
+| 2    | 24.58 GB     | 3070 MB    | 10         |
+| 3    | 24.17 GB     | 3406 MB    | 10         |
+| 4    | 24.52 GB     | 3757 MB    | 10         |
+
+### TurboQuant 3-bit
+| Turn | Active Memory | Cache Size | Cache Seqs |
+|------|--------------|------------|------------|
+| 1    | 22.17 GB     | 1098 MB    | 10         |
+
+**Memory savings after turn 1:**
+- Active memory: ~1.3 GB less (5.5% reduction)
+- Cache size: ~825 MB less (43% reduction)
+
+The cache size reduction is significant — TurboQuant is compressing the KV cache as expected.
 
 ## Outstanding Issue: `from_state` Missing Quantizer Params (continued)
 
@@ -46,9 +77,9 @@ The current approach is simpler and correct. The alternative would be needed if 
 
 ## What to Do Next
 
-1. **Live server test** — start the server with `--turbo-kv-bits 3` on the Qwen3.6 hybrid model, run the standard multi-turn test (Session A: turns 1-4), capture `/metrics` after each turn to verify memory footprint vs baseline.
-2. **Compare memory** — baseline vs TQ3: `prompt_cache.total_bytes` should be smaller with TurboQuant.
-3. **Run Session B** (turns 5-8) if Session A works — this tests tool-calling capability.
+1. **Continue multi-turn test** — run turns 2-4 on TQ3 server, capture `/metrics` after each turn to verify memory footprint vs baseline.
+2. **Run Session B** (turns 5-8) if Session A works — this tests tool-calling capability.
+3. **Compare memory growth** — track how `prompt_cache.total_bytes` grows across turns for both baseline and TQ3.
 
 ## Server Status
 
