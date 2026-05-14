@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import copy
 import argparse
+import copy
 import json
 import logging
 import pickle
@@ -907,6 +907,11 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         stream=generation_stream,
+                        turbo_kv_bits=getattr(self.cli_args, "turbo_kv_bits", None),
+                        turbo_fp16_layers=getattr(
+                            self.cli_args, "turbo_fp16_layers", 1
+                        ),
+                        turbo_v_bits=getattr(self.cli_args, "turbo_v_bits", None),
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -1860,16 +1865,22 @@ class APIHandler(BaseHTTPRequestHandler):
         model_size = 0
         if model_loaded:
             from mlx.utils import tree_flatten
+
             model_size = sum(
-                x.nbytes for _, x in tree_flatten(self.response_generator.model_provider.model)
+                x.nbytes
+                for _, x in tree_flatten(self.response_generator.model_provider.model)
             )
 
         # Draft model size if available
         draft_size = 0
         if draft_loaded:
             from mlx.utils import tree_flatten
+
             draft_size = sum(
-                x.nbytes for _, x in tree_flatten(self.response_generator.model_provider.draft_model)
+                x.nbytes
+                for _, x in tree_flatten(
+                    self.response_generator.model_provider.draft_model
+                )
             )
 
         metrics = {
