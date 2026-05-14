@@ -117,12 +117,15 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         mx.eval(out_loaded)
 
         # Outputs should match within bfloat16 precision.
-        # With 248k logits, mx.allclose with default tolerance fails due to
-        # accumulated bfloat16 precision noise (max diff ~0.4, mean diff ~0.06).
-        # Use atol (absolute tolerance) instead of rtol (relative tolerance)
-        # because bfloat16 precision is about absolute error for small values.
+        # We use atol (absolute tolerance) instead of rtol (relative tolerance)
+        # because logits can be near zero, making rtol unstable.
+        # atol=1e-0 accounts for bfloat16 precision floor (~0.01-0.1) and
+        # multiple comparisons across 248k logits (expecting some outliers).
+        # An error of 1.0 in a logit corresponds to a factor of e (~2.7) in
+        # probability, which is often acceptable for "close enough" in inference.
+        # If the error were 10.0 (significant degradation), this would fail.
         self.assertTrue(
-            mx.allclose(out_orig, out_loaded, atol=1e-0).item(),
+            mx.allclose(out_orig, out_loaded, rtol=0, atol=1e-0).item(),
             "Loaded cache outputs differ too much from original",
         )
 
@@ -353,13 +356,16 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
             loaded_tok, continue_tok,
             "Loaded cache produces different token than original cache",
         )
-        # Logits may differ slightly due to bfloat16 precision and quantization
-        # error accumulation. With 248k logits, mx.allclose with default tolerance
-        # fails due to accumulated bfloat16 precision noise (max diff ~0.6, mean diff ~0.09).
-        # Use atol (absolute tolerance) instead of rtol (relative tolerance)
-        # because bfloat16 precision is about absolute error for small values.
+        # Logits should match within bfloat16 precision.
+        # We use atol (absolute tolerance) instead of rtol (relative tolerance)
+        # because logits can be near zero, making rtol unstable.
+        # atol=1e-0 accounts for bfloat16 precision floor (~0.01-0.1) and
+        # multiple comparisons across 248k logits (expecting some outliers).
+        # An error of 1.0 in a logit corresponds to a factor of e (~2.7) in
+        # probability, which is often acceptable for "close enough" in inference.
+        # If the error were 10.0 (significant degradation), this would fail.
         self.assertTrue(
-            mx.allclose(logits_loaded[0], logits_continue[0], atol=1e-0).item(),
+            mx.allclose(logits_loaded[0], logits_continue[0], rtol=0, atol=1e-0).item(),
             "Loaded cache logits differ too much from original cache",
         )
 
