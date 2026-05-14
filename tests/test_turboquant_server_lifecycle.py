@@ -117,13 +117,13 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         mx.eval(out_loaded)
 
         # Outputs should match within bfloat16 precision.
-        # Check mean diff (not max diff, which can be large with 248k logits)
-        # Mean diff ~0.06 is within bfloat16 precision (~2 decimal places)
-        mean_diff = mx.mean(mx.abs(out_orig - out_loaded)).item()
-        self.assertLess(
-            mean_diff,
-            0.5,
-            f"Loaded cache outputs differ too much from original (mean diff: {mean_diff:.4f})",
+        # With 248k logits, mx.allclose with default tolerance fails due to
+        # accumulated bfloat16 precision noise (max diff ~0.4, mean diff ~0.06).
+        # Use atol (absolute tolerance) instead of rtol (relative tolerance)
+        # because bfloat16 precision is about absolute error for small values.
+        self.assertTrue(
+            mx.allclose(out_orig, out_loaded, atol=1e-0).item(),
+            "Loaded cache outputs differ too much from original",
         )
 
     # -- 2. Multi-step decode after merge --
@@ -354,13 +354,13 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
             "Loaded cache produces different token than original cache",
         )
         # Logits may differ slightly due to bfloat16 precision and quantization
-        # error accumulation. Check mean diff (not max diff, which can be large
-        # with 248k logits). Mean diff ~0.09 is within bfloat16 precision.
-        mean_diff = mx.mean(mx.abs(logits_loaded[0] - logits_continue[0])).item()
-        self.assertLess(
-            mean_diff,
-            0.5,
-            f"Loaded cache logits differ too much from original (mean diff: {mean_diff:.4f})",
+        # error accumulation. With 248k logits, mx.allclose with default tolerance
+        # fails due to accumulated bfloat16 precision noise (max diff ~0.6, mean diff ~0.09).
+        # Use atol (absolute tolerance) instead of rtol (relative tolerance)
+        # because bfloat16 precision is about absolute error for small values.
+        self.assertTrue(
+            mx.allclose(logits_loaded[0], logits_continue[0], atol=1e-0).item(),
+            "Loaded cache logits differ too much from original cache",
         )
 
 
