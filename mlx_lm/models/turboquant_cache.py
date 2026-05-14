@@ -542,18 +542,16 @@ class BatchTurboQuantKVCache:
         self._dtype_str = TurboQuantKVCache._DTYPE_NAME.get(keys.dtype, "float16")
         if self.quant_bits is None:
             self.quant_bits = 3
-            self.seed = 42
 
-        # Regenerate quantizer params from seed when missing (e.g. from_state).
-        # merge() sets these from the individual caches; from_state does not.
+        # Ensure quantizer params are present (set by merge() or from_state).
         if self._k_signs is None:
-            k_q = _Quantizer(k_dim, self.quant_bits, self.seed)
+            k_q = _Quantizer(k_dim, self.quant_bits, 42)
             self._k_signs = k_q.signs
             self._k_centroids = k_q.centroids
             self._k_dim = k_dim
             self._k_pdim = packed_dim(k_dim, self.quant_bits)
         if self._v_signs is None and self.v_bits is None:
-            v_q = _Quantizer(v_dim, self.quant_bits, self.seed + 1)
+            v_q = _Quantizer(v_dim, self.quant_bits, 43)
             self._v_signs = v_q.signs
             self._v_centroids = v_q.centroids
             self._v_dim = v_dim
@@ -823,29 +821,18 @@ class BatchTurboQuantKVCache:
         batch_cache.k_norms = kn
         batch_cache._dtype_str = dtype_str
         batch_cache.quant_bits = quant_bits
-        batch_cache.seed = seed
         batch_cache.v_bits = v_bits
         batch_cache._k_dim = k_dim
         batch_cache._v_dim = v_dim
         batch_cache._k_pdim = k_pdim
         batch_cache._v_pdim = v_pdim
         batch_cache.v_group_size = v_group_size
-        # Store quantizer parameters for correct dequantization.
-        # Regenerate from seed if missing (e.g. cache loaded via from_state).
-        if first._k_q is not None:
-            batch_cache._k_signs = first._k_q.signs
-            batch_cache._k_centroids = first._k_q.centroids
-        else:
-            k_q = _Quantizer(k_dim, quant_bits, seed)
-            batch_cache._k_signs = k_q.signs
-            batch_cache._k_centroids = k_q.centroids
-        if v_bits is None and first._v_q is not None:
+        # Copy quantizer parameters from first cache (always present after merge).
+        batch_cache._k_signs = first._k_q.signs
+        batch_cache._k_centroids = first._k_q.centroids
+        if v_bits is None:
             batch_cache._v_signs = first._v_q.signs
             batch_cache._v_centroids = first._v_q.centroids
-        elif v_bits is None:
-            v_q = _Quantizer(v_dim, quant_bits, seed + 1)
-            batch_cache._v_signs = v_q.signs
-            batch_cache._v_centroids = v_q.centroids
         batch_cache._idx = max_length
         batch_cache.offset += max_length
 
@@ -930,7 +917,6 @@ class BatchTurboQuantKVCache:
         padding = max(0, self.left_padding.tolist()[idx])
         cache = TurboQuantKVCache()
         cache.quant_bits = self.quant_bits
-        cache.seed = self.seed
         cache.v_bits = self.v_bits
         cache.v_group_size = self.v_group_size
         cache._k_dim = self._k_dim
@@ -938,6 +924,14 @@ class BatchTurboQuantKVCache:
         cache._k_pdim = self._k_pdim
         cache._v_pdim = self._v_pdim
         cache._dtype_str = self._dtype_str
+        # Copy quantizer params (always present after merge or from_state).
+        cache._k_q = _Quantizer(0, self.quant_bits, 0)
+        cache._k_q.signs = self._k_signs
+        cache._k_q.centroids = self._k_centroids
+        if self.v_bits is None:
+            cache._v_q = _Quantizer(0, self.quant_bits, 0)
+            cache._v_q.signs = self._v_signs
+            cache._v_q.centroids = self._v_centroids
 
         cache.k_packed = mx.contiguous(
             self.k_packed[idx : idx + 1, :, padding : self._idx, :]
@@ -1060,6 +1054,8 @@ class BatchTurboQuantKVCache:
         parts = [
             self.k_packed[..., :total, :],
             self.k_norms[..., :total],
+            self._k_signs,
+            self._k_centroids,
         ]
         if self.v_bits is not None:
             parts.extend(
@@ -1076,6 +1072,9 @@ class BatchTurboQuantKVCache:
                     self.v_norms[..., :total],
                 ]
             )
+        # Include value quantizer params (PolarQuant V) or skip (affine V)
+        if self.v_bits is None:
+            parts.extend([self._v_signs, self._v_centroids])
         # Include left_padding and offset for full serialization
         parts.append(self.left_padding)
         parts.append(self.offset)
@@ -1088,44 +1087,47 @@ class BatchTurboQuantKVCache:
         total = v[0].shape[2]
         self.k_packed = v[0]
         self.k_norms = v[1]
+        self._k_signs = v[2]
+        self._k_centroids = v[3]
         if self.v_bits is not None:
-            self._v_quant = v[2]
-            self._v_scales = v[3]
-            self._v_biases = v[4]
-            self.left_padding = v[5]
-            self.offset = v[6]
+            self._v_quant = v[4]
+            self._v_scales = v[5]
+            self._v_biases = v[6]
+            self.left_padding = v[7]
+            self.offset = v[8]
         else:
-            self.v_packed = v[2]
-            self.v_norms = v[3]
-            self.left_padding = v[4]
-            self.offset = v[5]
+            self.v_packed = v[4]
+            self.v_norms = v[5]
+            self._v_signs = v[6]
+            self._v_centroids = v[7]
+            self.left_padding = v[8]
+            self.offset = v[9]
         self._idx = total
 
     @property
     def meta_state(self):
         dtype_str = self._dtype_str or "float16"
         v_bits_str = str(self.v_bits) if self.v_bits is not None else "0"
-        return f"{self._idx},{self.quant_bits},{self.seed},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str},{self.v_group_size}"
+        return f"{self._idx},{self.quant_bits},{self._k_dim or 0},{self._v_dim or 0},{dtype_str},{v_bits_str},{self.v_group_size}"
 
     @meta_state.setter
     def meta_state(self, v):
         parts = v.split(",")
         self._idx = int(parts[0])
         self.quant_bits = int(parts[1])
-        self.seed = int(parts[2])
-        self._k_dim = int(parts[3]) or None
-        self._v_dim = int(parts[4]) or None
-        if len(parts) > 5:
-            self._dtype_str = parts[5]
+        self._k_dim = int(parts[2]) or None
+        self._v_dim = int(parts[3]) or None
+        if len(parts) > 4:
+            self._dtype_str = parts[4]
         else:
             self._dtype_str = "float16"
-        if len(parts) > 6:
-            vb = int(parts[6])
+        if len(parts) > 5:
+            vb = int(parts[5])
             self.v_bits = vb if vb > 0 else None
         else:
             self.v_bits = None
-        if len(parts) > 7:
-            self.v_group_size = int(parts[7])
+        if len(parts) > 6:
+            self.v_group_size = int(parts[6])
         else:
             self.v_group_size = 64
 
@@ -1144,7 +1146,6 @@ class BatchTurboQuantKVCache:
         obj.left_padding = None
         obj._dtype_str = None
         obj.quant_bits = None
-        obj.seed = None
         obj.v_bits = None
         obj._k_dim = None
         obj._v_dim = None
