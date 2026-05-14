@@ -179,10 +179,16 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
     # -- 3. Full server lifecycle --
 
     def test_full_server_lifecycle(self):
-        """Full server lifecycle: prefill → merge → serialize → from_state → decode → extend → filter → trim → decode.
+        """Full server lifecycle: prefill → merge → decode → extend → filter → trim → decode.
 
         This is the exact sequence the server runs through during a
         multi-turn conversation with continuous batching.
+
+        Note: from_state is NOT used in the normal server flow. The LRU cache
+        stores live Python objects and uses copy.deepcopy when fetching.
+        from_state is only for disk persistence (load_prompt_cache), which
+        is a separate concern tested by test_save_load_inference and
+        test_model_save_load_inference.
         """
         prompt_a = self.tokenizer.encode(
             "The quick brown fox jumps over the lazy dog and",
@@ -209,22 +215,7 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         tq_batched = [c for c in batched if isinstance(c, BatchTurboQuantKVCache)]
         self.assertGreater(len(tq_batched), 0)
 
-        # Step 3: Serialize
-        states = [c.state for c in tq_batched]
-        metas = [c.meta_state for c in tq_batched]
-
-        # Step 4: Restore via from_state
-        restored = [BatchTurboQuantKVCache.from_state(s, m) for s, m in zip(states, metas)]
-        restored_batched = []
-        tq_idx = 0
-        for c in batched:
-            if isinstance(c, BatchTurboQuantKVCache):
-                restored_batched.append(restored[tq_idx])
-                tq_idx += 1
-            else:
-                restored_batched.append(c)
-
-        # Step 5: Decode 2 tokens (batched, B=2)
+        # Step 3: Decode 2 tokens (batched, B=2)
         decode_tok_a = mx.expand_dims(
             self.tokenizer.encode("hello", return_tensors="mlx")[0], 0
         )
@@ -232,12 +223,12 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
             self.tokenizer.encode("world", return_tensors="mlx")[0], 0
         )
         batched_tok = mx.concatenate([decode_tok_a, decode_tok_b], axis=0)
-        out = self.model(batched_tok, cache=restored_batched)
+        out = self.model(batched_tok, cache=batched)
         mx.eval(out)
         self.assertTrue(mx.all(mx.isfinite(out)).item())
         self.assertEqual(out.shape[0], 2)
 
-        # Step 6: Extend with a new prompt
+        # Step 4: Extend with a new prompt
         prompt_c = self.tokenizer.encode(
             "The lazy dog slept all day long",
             return_tensors="mlx",
@@ -251,30 +242,30 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         # Merge cache_c into the batch
         new_tq_layers = [c for c in cache_c if isinstance(c, BatchTurboQuantKVCache)]
         if new_tq_layers:
-            for i, c in enumerate(restored_batched):
+            for i, c in enumerate(batched):
                 if isinstance(c, BatchTurboQuantKVCache):
                     c.extend(new_tq_layers[i])
 
-        # Step 7: Filter to keep only entry 0
-        for c in restored_batched:
+        # Step 5: Filter to keep only entry 0
+        for c in batched:
             if isinstance(c, BatchTurboQuantKVCache):
                 c.filter(mx.array([0]))
 
         # Verify only 1 entry remains
-        for c in restored_batched:
+        for c in batched:
             if isinstance(c, BatchTurboQuantKVCache):
                 self.assertEqual(c.offset.shape[0], 1)
 
-        # Step 8: Trim 1 token
-        for c in restored_batched:
+        # Step 6: Trim 1 token
+        for c in batched:
             if isinstance(c, BatchTurboQuantKVCache):
                 c.trim(1)
 
-        # Step 9: Decode 1 more token (single entry, B=1)
+        # Step 7: Decode 1 more token (single entry, B=1)
         decode_tok_final = mx.expand_dims(
             self.tokenizer.encode("test", return_tensors="mlx")[0], 0
         )
-        out_final = self.model(decode_tok_final, cache=restored_batched)
+        out_final = self.model(decode_tok_final, cache=batched)
         mx.eval(out_final)
         self.assertTrue(mx.all(mx.isfinite(out_final)).item())
 
