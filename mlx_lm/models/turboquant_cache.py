@@ -559,6 +559,11 @@ class BatchTurboQuantKVCache:
         self._k_centroids = None
         self._v_signs = None
         self._v_centroids = None
+        # Incremental decode buffers (matching TurboQuantKVCache pattern)
+        self._k_deq_buf = None
+        self._v_deq_buf = None
+        self._deq_offset = 0
+        self._deq_alloc = 0
 
     # ------------------------------------------------------------------
     # Core operations
@@ -665,7 +670,89 @@ class BatchTurboQuantKVCache:
 
         self._idx += S
         self.offset += S
-        return self._fetch_all()
+        total = self._idx
+
+        # Incremental decode (matching TurboQuantKVCache pattern):
+        # For small S (≤4), dequantize new tokens via dequant_fp16 Metal kernel
+        # instead of full packed_dequantize. This matches the single-mode path
+        # and avoids floating-point divergence between the two kernels.
+        if S <= 4 and self._v_deq_buf is not None and self._deq_offset == prev:
+            # Expand decode buffers if needed
+            if total > self._deq_alloc:
+                na = ((total + self.step - 1) // self.step) * self.step
+                self._k_deq_buf = mx.concatenate(
+                    [
+                        self._k_deq_buf[..., : self._deq_offset, :],
+                        mx.zeros((B, H, na - self._deq_alloc, self._k_dim), dtype=keys.dtype),
+                    ],
+                    2,
+                )
+                self._v_deq_buf = mx.concatenate(
+                    [
+                        self._v_deq_buf[..., : self._deq_offset, :],
+                        mx.zeros(
+                            (B, H, na - self._deq_alloc, self._v_dim), dtype=values.dtype
+                        ),
+                    ],
+                    2,
+                )
+                self._deq_alloc = na
+
+            # Dequantize new tokens for each entry using dequant_fp16
+            for i in range(B):
+                pad = int(self.left_padding[i])
+                start = prev + pad
+                end = start + S
+                key_slice = keys[i : i + 1, :, :, :]
+                val_slice = values[i : i + 1, :, :, :]
+
+                # Re-quantize to get packed data for dequant_fp16
+                k_pk_i, k_nrm_i = self._quantize_key_packed(key_slice)
+                nk = dequant_fp16(
+                    k_pk_i.reshape(-1, self._k_pdim),
+                    k_nrm_i,
+                    self._k_centroids,
+                    self._get_k_signs(),
+                    self._k_dim,
+                    self.quant_bits,
+                ).reshape(1, H, S, self._k_dim)
+                self._k_deq_buf[i : i + 1, :, start:end, :] = nk
+
+                if self.v_bits is not None:
+                    vq, vs, vb = mx.quantize(
+                        val_slice, group_size=self.v_group_size, bits=self.v_bits
+                    )
+                    nv = mx.dequantize(
+                        vq, vs, vb, group_size=self.v_group_size, bits=self.v_bits
+                    ).astype(values.dtype)
+                    self._v_deq_buf[i : i + 1, :, start:end, :] = nv
+                else:
+                    v_pk_i, v_nrm_i = self._quantize_value_packed(val_slice)
+                    nv = dequant_fp16(
+                        v_pk_i.reshape(-1, self._v_pdim),
+                        v_nrm_i,
+                        self._v_centroids,
+                        self._get_v_signs(),
+                        self._v_dim,
+                        self.quant_bits,
+                    ).reshape(1, H, S, self._v_dim)
+                    self._v_deq_buf[i : i + 1, :, start:end, :] = nv
+
+            self._deq_offset = total
+            return self._k_deq_buf[..., :total, :], self._v_deq_buf[..., :total, :]
+
+        # Full dequant (prefill or S > 4)
+        all_k, all_v = self._fetch_all()
+        total = self._idx
+        alloc = ((total + self.step - 1) // self.step) * self.step
+        if self._k_deq_buf is None or self._deq_alloc < total:
+            self._k_deq_buf = mx.zeros((B, H, alloc, self._k_dim), dtype=keys.dtype)
+            self._v_deq_buf = mx.zeros((B, H, alloc, self._v_dim), dtype=values.dtype)
+            self._deq_alloc = alloc
+        self._k_deq_buf[..., :total, :] = all_k
+        self._v_deq_buf[..., :total, :] = all_v
+        self._deq_offset = total
+        return all_k, all_v
 
     def _quantize_key(self, keys):
         """Quantize keys using PolarQuant (Hadamard rotation + codebook).
@@ -1196,6 +1283,11 @@ class BatchTurboQuantKVCache:
         obj._k_centroids = None
         obj._v_signs = None
         obj._v_centroids = None
+        # Incremental decode buffers (initialized empty)
+        obj._k_deq_buf = None
+        obj._v_deq_buf = None
+        obj._deq_offset = 0
+        obj._deq_alloc = 0
         obj.meta_state = meta_state
         obj.state = state
         return obj
