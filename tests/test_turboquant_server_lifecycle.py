@@ -1,9 +1,10 @@
 # Copyright © 2024 Apple Inc.
 
-"""Server lifecycle tests for BatchTurboQuantKVCache.
+"""Server lifecycle tests for BatchTurboQuantKVCache with Qwen3.6 hybrid model.
 
-These tests exercise the full server flow that opencode uses, following
-patterns from test_prompt_cache.py and test_deepseek_v4.py:
+These tests exercise the full server flow that opencode uses with the Qwen3.6
+hybrid model (SSM+Transformer), following patterns from test_prompt_cache.py
+and test_deepseek_v4.py:
 
 - test_save_load_rotating_cache: save→load→feed same tokens→verify outputs match
 - test_cache_with_generate: multi-step generation with cache continuation
@@ -13,8 +14,12 @@ patterns from test_prompt_cache.py and test_deepseek_v4.py:
 Covers:
 1. Save→load inference check (pattern from test_save_load_rotating_cache)
 2. Multi-step decode after merge (actual GenerationBatch._step() flow)
-3. Full server lifecycle (prefill→merge→serialize→from_state→decode→extend→filter→trim→decode)
+3. Full server lifecycle (prefill → merge → decode → extend → filter → trim → decode)
 4. Model-level save/load with inference check (pattern from test_cache_with_generate)
+
+Note: Qwen3.6 hybrid has SSM layers (ArraysCache) and attention layers
+(TurboQuantKVCache → BatchTurboQuantKVCache). Only attention layers participate
+in merge/filter/extend/trim operations.
 """
 
 import os
@@ -33,20 +38,22 @@ from mlx_lm.models.turboquant_cache import BatchTurboQuantKVCache
 
 
 class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
-    """Server lifecycle tests for BatchTurboQuantKVCache.
+    """Server lifecycle tests for BatchTurboQuantKVCache with Qwen3.6 hybrid.
 
-    Tests the actual server flows:
+    Tests the actual server flows with the Qwen3.6 hybrid model:
     1. Save→load inference check (save_prompt_cache → load_prompt_cache → decode)
-    2. Multi-step decode after merge (GenerationBatch._step() flow: merge → decode → decode → decode)
-    3. Full server lifecycle (prefill → merge → serialize → from_state → decode → extend → filter → trim → decode)
-    4. Model-level save/load with inference check (generate → save → load → continue generating)
+    2. Multi-step decode after merge (GenerationBatch._step() flow)
+    3. Full server lifecycle (prefill → merge → decode → extend → filter → trim → decode)
+    4. Model-level save/load with inference check (generate → save → load → continue)
     """
 
     @classmethod
     def setUpClass(cls):
         from mlx_lm.utils import load
 
-        cls.model, cls.tokenizer = load("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        cls.model, cls.tokenizer = load(
+            "/Users/michael/.localllm/models/Qwen3.6-35B-A3B-UD-MLX-4bit"
+        )
 
     def setUp(self):
         self.test_dir_fid = tempfile.TemporaryDirectory()
@@ -54,6 +61,13 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
 
     def tearDown(self):
         self.test_dir_fid.cleanup()
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _tq_layers(cache):
+        """Extract only BatchTurboQuantKVCache layers from a cache list."""
+        return [c for c in cache if isinstance(c, BatchTurboQuantKVCache)]
 
     # -- 1. Save→load inference check (pattern from test_save_load_rotating_cache) --
 
@@ -106,7 +120,7 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
             "Loaded cache produces different outputs than original",
         )
 
-    # -- 2. Multi-step decode after from_state --
+    # -- 2. Multi-step decode after merge --
 
     def test_multi_step_decode_after_merge(self):
         """Merge → multi-step decode → verify offsets advance correctly.
@@ -140,15 +154,15 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
 
         # Merge into batched caches (B=2)
         batched = [ca.merge([ca, cb]) for ca, cb in zip(cache_a, cache_b)]
-        tq_batched = [c for c in batched if isinstance(c, BatchTurboQuantKVCache)]
+        tq_batched = self._tq_layers(batched)
         self.assertGreater(len(tq_batched), 0)
 
-        # Record pre-decode offsets
+        # Record pre-decode offsets (only for TQ layers)
         pre_offsets = {}
         for i, c in enumerate(batched):
-            if hasattr(c, "offset"):
+            if isinstance(c, BatchTurboQuantKVCache):
                 mx.eval(c.offset)
-                pre_offsets[i] = c.offset.tolist() if hasattr(c.offset, "tolist") else [c.offset]
+                pre_offsets[i] = c.offset.tolist()
 
         # Multi-step decode: 3 tokens (batched, B=2)
         decode_tokens = self.tokenizer.encode(
@@ -166,11 +180,11 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         # Verify offsets advanced by decode length
         decode_len = decode_tokens.shape[1]
         for i, c in enumerate(batched):
-            if hasattr(c, "offset") and i in pre_offsets:
+            if isinstance(c, BatchTurboQuantKVCache) and i in pre_offsets:
                 mx.eval(c.offset)
-                offsets = c.offset.tolist() if hasattr(c.offset, "tolist") else [c.offset]
+                offsets = c.offset.tolist()
                 for j, off in enumerate(offsets):
-                    expected = pre_offsets[i][j] + decode_len if j < len(pre_offsets[i]) else off
+                    expected = pre_offsets[i][j] + decode_len
                     self.assertEqual(
                         off, expected,
                         f"Offset mismatch at layer {i}, entry {j}: got {off}, expected {expected}",
@@ -187,7 +201,7 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         Note: from_state is NOT used in the normal server flow. The LRU cache
         stores live Python objects and uses copy.deepcopy when fetching.
         from_state is only for disk persistence (load_prompt_cache), which
-        is a separate concern tested by test_save_load_inference and
+        is tested separately by test_save_load_inference and
         test_model_save_load_inference.
         """
         prompt_a = self.tokenizer.encode(
@@ -212,7 +226,7 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
 
         # Step 2: Merge into batched caches
         batched = [ca.merge([ca, cb]) for ca, cb in zip(cache_a, cache_b)]
-        tq_batched = [c for c in batched if isinstance(c, BatchTurboQuantKVCache)]
+        tq_batched = self._tq_layers(batched)
         self.assertGreater(len(tq_batched), 0)
 
         # Step 3: Decode 2 tokens (batched, B=2)
@@ -239,24 +253,26 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         _ = self.model(mx.expand_dims(prompt_c, 0), cache=cache_c)
         mx.eval()
 
-        # Merge cache_c into the batch
-        new_tq_layers = [c for c in cache_c if isinstance(c, BatchTurboQuantKVCache)]
-        if new_tq_layers:
+        # Merge cache_c into the batch (only TQ layers)
+        new_tq = self._tq_layers(cache_c)
+        if new_tq:
+            tq_idx = 0
             for i, c in enumerate(batched):
                 if isinstance(c, BatchTurboQuantKVCache):
-                    c.extend(new_tq_layers[i])
+                    c.extend(new_tq[tq_idx])
+                    tq_idx += 1
 
-        # Step 5: Filter to keep only entry 0
+        # Step 5: Filter to keep only entry 0 (only TQ layers)
         for c in batched:
             if isinstance(c, BatchTurboQuantKVCache):
                 c.filter(mx.array([0]))
 
-        # Verify only 1 entry remains
+        # Verify only 1 entry remains in TQ layers
         for c in batched:
             if isinstance(c, BatchTurboQuantKVCache):
                 self.assertEqual(c.offset.shape[0], 1)
 
-        # Step 6: Trim 1 token
+        # Step 6: Trim 1 token (only TQ layers)
         for c in batched:
             if isinstance(c, BatchTurboQuantKVCache):
                 c.trim(1)
@@ -325,7 +341,7 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         # Handle both int and mx.array token types
         loaded_tok = toks_loaded[0].item() if hasattr(toks_loaded[0], "item") else toks_loaded[0]
         continue_tok = toks_continue[0].item() if hasattr(toks_continue[0], "item") else toks_continue[0]
-        
+
         self.assertEqual(
             loaded_tok, continue_tok,
             "Loaded cache produces different token than original cache",
