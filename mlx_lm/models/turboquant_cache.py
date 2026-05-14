@@ -243,7 +243,7 @@ class TurboQuantKVCache:
                         self._k_deq_buf[..., : self._deq_offset, :],
                         mx.zeros((B, H, na - self._deq_alloc, k_dim), dtype=keys.dtype),
                     ],
-                    axis=2,
+                    2,
                 )
                 self._v_deq_buf = mx.concatenate(
                     [
@@ -252,7 +252,7 @@ class TurboQuantKVCache:
                             (B, H, na - self._deq_alloc, v_dim), dtype=values.dtype
                         ),
                     ],
-                    axis=2,
+                    2,
                 )
                 self._deq_alloc = na
 
@@ -1025,15 +1025,15 @@ class BatchTurboQuantKVCache:
         r1 = pad_cache(self)
         r2 = pad_cache(other)
 
-        self.k_packed = mx.concatenate([r1[0], r2[0]], axis=0)
-        self.k_norms = mx.concatenate([r1[1], r2[1]], axis=0)
+        self.k_packed = mx.concatenate([r1[0], r2[0]], 0)
+        self.k_norms = mx.concatenate([r1[1], r2[1]], 0)
         if self.v_bits is not None:
-            self._v_quant = mx.concatenate([r1[2], r2[2]], axis=0)
-            self._v_scales = mx.concatenate([r1[3], r2[3]], axis=0)
-            self._v_biases = mx.concatenate([r1[4], r2[4]], axis=0)
+            self._v_quant = mx.concatenate([r1[2], r2[2]], 0)
+            self._v_scales = mx.concatenate([r1[3], r2[3]], 0)
+            self._v_biases = mx.concatenate([r1[4], r2[4]], 0)
         else:
-            self.v_packed = mx.concatenate([r1[2], r2[2]], axis=0)
-            self.v_norms = mx.concatenate([r1[3], r2[3]], axis=0)
+            self.v_packed = mx.concatenate([r1[2], r2[2]], 0)
+            self.v_norms = mx.concatenate([r1[3], r2[3]], 0)
         self.left_padding = mx.concatenate([r1[5], r2[5]])
         self.offset = mx.concatenate([r1[6], r2[6]])
         self._idx = max_idx
