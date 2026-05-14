@@ -830,12 +830,22 @@ class BatchTurboQuantKVCache:
         batch_cache._k_pdim = k_pdim
         batch_cache._v_pdim = v_pdim
         batch_cache.v_group_size = v_group_size
-        # Store quantizer parameters for correct dequantization
-        batch_cache._k_signs = first._k_q.signs
-        batch_cache._k_centroids = first._k_q.centroids
+        # Store quantizer parameters for correct dequantization.
+        # Regenerate from seed if missing (e.g. cache loaded via from_state).
+        if first._k_q is not None:
+            batch_cache._k_signs = first._k_q.signs
+            batch_cache._k_centroids = first._k_q.centroids
+        else:
+            k_q = _Quantizer(k_dim, quant_bits, seed)
+            batch_cache._k_signs = k_q.signs
+            batch_cache._k_centroids = k_q.centroids
         if v_bits is None and first._v_q is not None:
             batch_cache._v_signs = first._v_q.signs
             batch_cache._v_centroids = first._v_q.centroids
+        elif v_bits is None:
+            v_q = _Quantizer(v_dim, quant_bits, seed + 1)
+            batch_cache._v_signs = v_q.signs
+            batch_cache._v_centroids = v_q.centroids
         batch_cache._idx = max_length
         batch_cache.offset += max_length
 
