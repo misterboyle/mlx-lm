@@ -377,5 +377,96 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
         )
 
 
+    # -- 5. Quality test: batch+TurboQuant must match single-mode+TurboQuant output style --
+
+    def test_batch_turbo_quant_matches_single_mode(self):
+        """Regression test: batch+TurboQuant output must match single-mode+TurboQuant output.
+
+        This test locks down a critical quality regression where batch+TurboQuant
+        produces output with a completely different style than single-mode+TurboQuant.
+
+        The bug manifests as:
+        - Batch output starts with "Here's a thinking process:" instead of direct answer
+        - Batch output has different structure/content than single-mode
+        - The model's reasoning style changes when going through BatchGenerator
+
+        Single-mode TurboQuant is the known-good baseline.
+        Batch+TurboQuant must match single-mode+TurboQuant output style.
+
+        Batching should not add quality degradation on top of quantization.
+        The same quantization method should produce similar output regardless of batching.
+        """
+        from mlx_lm.generate import batch_generate
+
+        # Realistic multi-turn conversation with system prompt
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. You can use tools to read files and run commands."},
+            {"role": "user", "content": "Look at the mlx_lm/models directory. Find the TurboQuant cache implementation and explain how the quantize-on-write lifecycle works. Specifically: how are the norms stored, and when does quantization happen?"},
+        ]
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        tokens = self.tokenizer.encode(prompt, return_tensors="mlx")[0]
+
+        # --- Single-mode TurboQuant (known good baseline) ---
+        cache_single = make_prompt_cache(
+            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
+        )
+        results_single = list(
+            generate_step(tokens, self.model, prompt_cache=cache_single, max_tokens=200)
+        )
+        toks_single, logits_single = zip(*results_single)
+        mx.eval(*toks_single, *logits_single)
+        generated_single = self.tokenizer.decode(list(toks_single))
+
+        # --- Batch+TurboQuant (must match single-mode) ---
+        response_batch = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts=[tokens.tolist()],
+            max_tokens=200,
+            turbo_kv_bits=3,
+            turbo_fp16_layers=1,
+        )
+        generated_batch = response_batch.texts[0]
+
+        # Word similarity
+        single_words = set(generated_single.lower().split())
+        batch_words = set(generated_batch.lower().split())
+        overlap = len(single_words & batch_words)
+        total = len(single_words | batch_words)
+        similarity = overlap / total if total > 0 else 0
+
+        # Batching should not add quality degradation on top of quantization.
+        # The same quantization method should produce similar output regardless of batching.
+        # A threshold of 0.70 allows for minor stochastic variation but catches
+        # the regression where batch output has a completely different style.
+        self.assertGreater(
+            similarity, 0.70,
+            f"Batch+TurboQuant output style differs from single-mode+TurboQuant "
+            f"(similarity={similarity:.2f}). Batch output should match single-mode output style. "
+            f"Batching should not add quality degradation on top of quantization."
+        )
+
+        # Also check that batch output doesn't start with reasoning-style prefixes
+        # that single-mode doesn't use
+        single_starts_with_reasoning = generated_single.strip().startswith(
+            ("Here's a thinking", "Thinking Process:", "Here is the thinking")
+        )
+        batch_starts_with_reasoning = generated_batch.strip().startswith(
+            ("Here's a thinking", "Thinking Process:", "Here is the thinking")
+        )
+
+        # If single-mode doesn't start with reasoning but batch does, that's the bug
+        if not single_starts_with_reasoning and batch_starts_with_reasoning:
+            self.fail(
+                "Batch+TurboQuant output starts with reasoning-style prefix "
+                f"({generated_batch[:50]}) while single-mode does not "
+                f"({generated_single[:50]}). This indicates the model's output style "
+                "has changed when going through BatchGenerator."
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
