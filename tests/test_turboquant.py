@@ -20,24 +20,24 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import (
     KVCache,
+    can_trim_prompt_cache,
+    load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
-    load_prompt_cache,
     trim_prompt_cache,
-    can_trim_prompt_cache,
 )
-from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+from mlx_lm.models.turboquant_cache import BatchTurboQuantKVCache, TurboQuantKVCache
 from mlx_lm.models.turboquant_packing import (
-    pack_indices,
-    unpack_indices,
-    packed_dim,
     VALS_PER_WORD,
+    pack_indices,
+    packed_dim,
+    unpack_indices,
 )
 from mlx_lm.models.turboquant_rotation import (
-    walsh_hadamard_transform,
+    inverse_randomized_hadamard,
     random_diagonal_sign,
     randomized_hadamard_transform,
-    inverse_randomized_hadamard,
+    walsh_hadamard_transform,
 )
 
 
@@ -59,9 +59,9 @@ class TestBitPacking(unittest.TestCase):
         for bits in [1, 2, 3, 4]:
             max_val = (1 << bits) - 1
             for dim in [16, 64, 96, 128]:
-                indices = mx.random.randint(
-                    0, max_val + 1, shape=(4, dim)
-                ).astype(mx.uint8)
+                indices = mx.random.randint(0, max_val + 1, shape=(4, dim)).astype(
+                    mx.uint8
+                )
                 packed = pack_indices(indices, bits)
                 self.assertEqual(packed.shape[-1], packed_dim(dim, bits))
                 unpacked = unpack_indices(packed, bits, dim)
@@ -74,9 +74,9 @@ class TestBitPacking(unittest.TestCase):
         """Test with batch and head dimensions."""
         for bits in [1, 2, 3, 4]:
             max_val = (1 << bits) - 1
-            indices = mx.random.randint(
-                0, max_val + 1, shape=(2, 8, 10, 128)
-            ).astype(mx.uint8)
+            indices = mx.random.randint(0, max_val + 1, shape=(2, 8, 10, 128)).astype(
+                mx.uint8
+            )
             packed = pack_indices(indices, bits)
             unpacked = unpack_indices(packed, bits, 128)
             self.assertTrue(mx.array_equal(indices, unpacked))
@@ -307,10 +307,10 @@ class TestTurboQuantKVCache(unittest.TestCase):
 
         meta = cache.meta_state
         parts = meta.split(",")
-        self.assertEqual(int(parts[0]), 10)   # offset
-        self.assertEqual(int(parts[1]), 3)    # bits
-        self.assertEqual(int(parts[2]), 99)   # seed
-        self.assertEqual(int(parts[3]), 64)   # k_dim
+        self.assertEqual(int(parts[0]), 10)  # offset
+        self.assertEqual(int(parts[1]), 3)  # bits
+        self.assertEqual(int(parts[2]), 99)  # seed
+        self.assertEqual(int(parts[3]), 64)  # k_dim
         self.assertEqual(int(parts[4]), 128)  # v_dim
 
     def test_from_state(self):
@@ -416,9 +416,7 @@ class TestMakePromptCache(unittest.TestCase):
 
     def test_make_prompt_cache_turbo(self):
         """make_prompt_cache with turbo_kv_bits creates mixed cache."""
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
         num_layers = len(self.model.layers)
         self.assertEqual(len(cache), num_layers)
 
@@ -435,9 +433,7 @@ class TestMakePromptCache(unittest.TestCase):
         """Different turbo_fp16_layers values."""
         num_layers = len(self.model.layers)
 
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=2
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=2)
         # First 2 and last 2 layers should be KVCache
         self.assertIsInstance(cache[0], KVCache)
         self.assertIsInstance(cache[1], KVCache)
@@ -454,15 +450,11 @@ class TestMakePromptCache(unittest.TestCase):
 
     def test_turbo_cache_trimmable(self):
         """Mixed cache should be fully trimmable."""
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
         self.assertTrue(can_trim_prompt_cache(cache))
 
     def test_turbo_cache_trim(self):
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
         # Feed some data
         for c in cache:
             k = mx.random.normal(shape=(1, 8, 10, 96))
@@ -491,9 +483,7 @@ class TestTurboQuantGeneration(unittest.TestCase):
         from mlx_lm.generate import generate_step
 
         prompt = self.tokenizer.encode("Hello, how are", return_tensors="mlx")[0]
-        cache = make_prompt_cache(
-            self.model, turbo_kv_bits=3, turbo_fp16_layers=1
-        )
+        cache = make_prompt_cache(self.model, turbo_kv_bits=3, turbo_fp16_layers=1)
 
         tokens = []
         for _, (tok, logits) in zip(
@@ -512,9 +502,9 @@ class TestTurboQuantGeneration(unittest.TestCase):
         """TurboQuant 4-bit should produce similar outputs to baseline."""
         from mlx_lm.generate import generate_step
 
-        prompt = self.tokenizer.encode("The capital of France is", return_tensors="mlx")[
-            0
-        ]
+        prompt = self.tokenizer.encode(
+            "The capital of France is", return_tensors="mlx"
+        )[0]
 
         # Baseline generation
         base_cache = make_prompt_cache(self.model)
@@ -527,9 +517,7 @@ class TestTurboQuantGeneration(unittest.TestCase):
             base_logits.append(logits)
 
         # TurboQuant 4-bit generation (highest quality)
-        tq_cache = make_prompt_cache(
-            self.model, turbo_kv_bits=4, turbo_fp16_layers=1
-        )
+        tq_cache = make_prompt_cache(self.model, turbo_kv_bits=4, turbo_fp16_layers=1)
         tq_tokens = []
         tq_logits = []
         for _, (tok, logits) in zip(
@@ -737,7 +725,8 @@ class TestValueCompression(unittest.TestCase):
         var = mx.var(v.astype(mx.float32)).item()
         nmse = mse / (var + 1e-12)
         self.assertLess(
-            nmse, 0.1,
+            nmse,
+            0.1,
             f"4-bit affine value normalized MSE too high: {nmse:.4f}",
         )
 
@@ -824,22 +813,21 @@ class TestValueCompression(unittest.TestCase):
             v_flat = v.reshape(-1, self.D)
             vr_flat = v_ret.reshape(-1, self.D)
             dots = mx.sum(v_flat * vr_flat, axis=-1)
-            norms = (
-                mx.linalg.norm(v_flat, axis=-1)
-                * mx.linalg.norm(vr_flat, axis=-1)
-            )
+            norms = mx.linalg.norm(v_flat, axis=-1) * mx.linalg.norm(vr_flat, axis=-1)
             cs = mx.mean(dots / (norms + 1e-10))
             mx.eval(cs)
             cos_sims[vb] = cs.item()
 
         # Monotonicity: 8 >= 4 >= 2. Small slack for FP noise.
         self.assertGreaterEqual(
-            cos_sims[8], cos_sims[4] - 1e-3,
+            cos_sims[8],
+            cos_sims[4] - 1e-3,
             f"cos-sim(v_bits=8)={cos_sims[8]:.4f} < "
             f"cos-sim(v_bits=4)={cos_sims[4]:.4f}",
         )
         self.assertGreaterEqual(
-            cos_sims[4], cos_sims[2] - 1e-3,
+            cos_sims[4],
+            cos_sims[2] - 1e-3,
             f"cos-sim(v_bits=4)={cos_sims[4]:.4f} < "
             f"cos-sim(v_bits=2)={cos_sims[2]:.4f}",
         )
@@ -946,10 +934,7 @@ class TestValueCompression(unittest.TestCase):
         v_flat = v.reshape(-1, v_dim)
         vr_flat = v_ret.reshape(-1, v_dim)
         dots = mx.sum(v_flat * vr_flat, axis=-1)
-        norms = (
-            mx.linalg.norm(v_flat, axis=-1)
-            * mx.linalg.norm(vr_flat, axis=-1)
-        )
+        norms = mx.linalg.norm(v_flat, axis=-1) * mx.linalg.norm(vr_flat, axis=-1)
         cs = mx.mean(dots / (norms + 1e-10))
         mx.eval(cs)
         self.assertGreater(cs.item(), 0.95)
@@ -985,3 +970,398 @@ class TestValueCompression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# BatchTurboQuantKVCache tests
+# ---------------------------------------------------------------------------
+class TestBatchTurboQuantKVCache(unittest.TestCase):
+    """Tests for BatchTurboQuantKVCache: batched wrapper of TurboQuantKVCache.
+
+    Covers merge/filter/extend/extract/state roundtrip/trim/mask, plus both
+    value modes (PolarQuant V and affine-quantized V).
+    """
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _make_tq_cache(seq_len, bits=3, v_bits=None, seed=42):
+        """Build a TurboQuantKVCache populated with random keys/values."""
+        mx.random.seed(seed)
+        cache = TurboQuantKVCache(bits=bits, v_bits=v_bits)
+        B, H, S, D = 1, 4, seq_len, 64
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        cache.update_and_fetch(k, v)
+        return cache
+
+    # -- basic merge / structure ------------------------------------------
+
+    def test_merge_two_caches(self):
+        """Merge two TurboQuantKVCache instances into a BatchTurboQuantKVCache (B=2)."""
+        c1 = self._make_tq_cache(10, seed=1)
+        c2 = self._make_tq_cache(15, seed=2)
+
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+        self.assertEqual(batch.k_packed.shape[0], 2)
+        self.assertEqual(batch.offset.shape[0], 2)
+        self.assertEqual(batch.left_padding.shape[0], 2)
+        self.assertEqual(batch._idx, 15)
+
+    def test_merge_affine_v(self):
+        """Merge with affine-quantized V (v_bits set)."""
+        c1 = self._make_tq_cache(10, v_bits=4, seed=1)
+        c2 = self._make_tq_cache(15, v_bits=4, seed=2)
+
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        self.assertIsInstance(batch, BatchTurboQuantKVCache)
+        self.assertEqual(batch.k_packed.shape[0], 2)
+        self.assertEqual(batch._idx, 15)
+        self.assertIsNotNone(batch._v_quant)
+        self.assertIsNotNone(batch._v_scales)
+        self.assertIsNotNone(batch._v_biases)
+        self.assertIsNone(batch.v_packed)
+        self.assertIsNone(batch.v_norms)
+
+    def test_offset_tracking(self):
+        """After merge, per-entry offsets match original cache sizes."""
+        c1 = self._make_tq_cache(10, seed=3)
+        c2 = self._make_tq_cache(15, seed=4)
+
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        self.assertIsInstance(batch.offset, mx.array)
+        mx.eval(batch.offset)
+        offsets = batch.offset.tolist()
+        self.assertEqual(offsets, [10, 15])
+
+    # -- empty / size -----------------------------------------------------
+
+    def test_empty(self):
+        """A freshly constructed batch cache is empty()."""
+        batch = BatchTurboQuantKVCache([0, 0])
+        self.assertTrue(batch.empty())
+
+    def test_empty_after_populate(self):
+        """A populated cache should not be empty."""
+        c1 = self._make_tq_cache(8, seed=5)
+        c2 = self._make_tq_cache(8, seed=6)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        self.assertFalse(batch.empty())
+
+    def test_size(self):
+        """size() returns _idx (max length across entries)."""
+        c1 = self._make_tq_cache(7, seed=7)
+        c2 = self._make_tq_cache(11, seed=8)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        self.assertEqual(batch.size(), 11)
+
+    # -- extend / filter --------------------------------------------------
+
+    def test_extend_filter(self):
+        """extend() concatenates along batch dim; filter() keeps a subset."""
+        c1 = self._make_tq_cache(6, seed=9)
+        c2 = self._make_tq_cache(8, seed=10)
+        batch_a = BatchTurboQuantKVCache.merge([c1, c2])
+
+        c3 = self._make_tq_cache(10, seed=11)
+        batch_b = BatchTurboQuantKVCache.merge([c3])
+
+        batch_a.extend(batch_b)
+        mx.eval(batch_a.offset)
+        self.assertEqual(batch_a.offset.shape[0], 3)
+        self.assertEqual(batch_a.k_packed.shape[0], 3)
+
+        # Keep entries [0, 2] only
+        batch_a.filter(mx.array([0, 2]))
+        mx.eval(batch_a.offset)
+        self.assertEqual(batch_a.offset.shape[0], 2)
+        self.assertEqual(batch_a.k_packed.shape[0], 2)
+        offsets = batch_a.offset.tolist()
+        self.assertEqual(offsets, [6, 10])
+
+    def test_extend_filter_affine_v(self):
+        """extend/filter with affine-quantized V."""
+        c1 = self._make_tq_cache(6, v_bits=4, seed=9)
+        c2 = self._make_tq_cache(8, v_bits=4, seed=10)
+        batch_a = BatchTurboQuantKVCache.merge([c1, c2])
+
+        c3 = self._make_tq_cache(10, v_bits=4, seed=11)
+        batch_b = BatchTurboQuantKVCache.merge([c3])
+
+        batch_a.extend(batch_b)
+        mx.eval(batch_a.offset)
+        self.assertEqual(batch_a.offset.shape[0], 3)
+
+        batch_a.filter(mx.array([0, 2]))
+        mx.eval(batch_a.offset)
+        self.assertEqual(batch_a.offset.shape[0], 2)
+        self.assertIsNotNone(batch_a._v_quant)
+
+    # -- state serialization ---------------------------------------------
+
+    def test_state_roundtrip(self):
+        """state/meta_state -> from_state round-trip preserves storage arrays."""
+        c1 = self._make_tq_cache(6, seed=12)
+        c2 = self._make_tq_cache(9, seed=13)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        mx.eval(batch.k_packed, batch.k_norms, batch.offset, batch.left_padding)
+
+        state = batch.state
+        meta = batch.meta_state
+        restored = BatchTurboQuantKVCache.from_state(state, meta)
+
+        self.assertEqual(restored._idx, batch._idx)
+        self.assertTrue(
+            mx.array_equal(
+                restored.k_packed[..., : restored._idx, :],
+                batch.k_packed[..., : batch._idx, :],
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                restored.k_norms[..., : restored._idx],
+                batch.k_norms[..., : batch._idx],
+            )
+        )
+        self.assertTrue(mx.array_equal(restored.offset, batch.offset))
+        self.assertTrue(mx.array_equal(restored.left_padding, batch.left_padding))
+
+    def test_state_roundtrip_affine_v(self):
+        """state/meta_state round-trip with affine-quantized V."""
+        c1 = self._make_tq_cache(6, v_bits=4, seed=12)
+        c2 = self._make_tq_cache(9, v_bits=4, seed=13)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        mx.eval(batch.k_packed, batch._v_quant, batch.offset, batch.left_padding)
+
+        state = batch.state
+        meta = batch.meta_state
+        restored = BatchTurboQuantKVCache.from_state(state, meta)
+
+        self.assertEqual(restored._idx, batch._idx)
+        self.assertTrue(
+            mx.array_equal(
+                restored.k_packed[..., : restored._idx, :],
+                batch.k_packed[..., : batch._idx, :],
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                restored._v_quant[..., : restored._idx, :],
+                batch._v_quant[..., : batch._idx, :],
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                restored._v_scales[..., : restored._idx, :],
+                batch._v_scales[..., : batch._idx, :],
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                restored._v_biases[..., : restored._idx, :],
+                batch._v_biases[..., : batch._idx, :],
+            )
+        )
+
+    # -- trim ------------------------------------------------------------
+
+    def test_trim(self):
+        """Trim decrements _idx and offsets."""
+        c1 = self._make_tq_cache(10, seed=14)
+        c2 = self._make_tq_cache(10, seed=15)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        mx.eval(batch.offset)
+        offsets_before = batch.offset.tolist()
+        self.assertEqual(batch._idx, 10)
+
+        n = batch.trim(3)
+        self.assertEqual(n, 3)
+        self.assertEqual(batch._idx, 7)
+        mx.eval(batch.offset)
+        offsets_after = batch.offset.tolist()
+        self.assertEqual(offsets_after, [o - 3 for o in offsets_before])
+
+    def test_trim_clamps_to_idx(self):
+        """trim(n) clamps to _idx."""
+        c1 = self._make_tq_cache(5, seed=16)
+        c2 = self._make_tq_cache(5, seed=17)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        n = batch.trim(100)
+        self.assertEqual(n, 5)
+        self.assertEqual(batch._idx, 0)
+
+    # -- make_mask -------------------------------------------------------
+
+    def test_make_mask(self):
+        """make_mask returns a per-entry boolean mask with left-padding."""
+        c1 = self._make_tq_cache(6, seed=18)
+        c2 = self._make_tq_cache(8, seed=19)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        mask = batch.make_mask(1)
+        mx.eval(mask, batch.left_padding, batch.offset)
+
+        self.assertIn(2, mask.shape)
+        self.assertEqual(mask.shape[-1], batch._idx + 1)
+        self.assertEqual(mask.dtype, mx.bool_)
+
+        lp = batch.left_padding.tolist()
+        self.assertEqual(lp, [2, 0])
+
+        m0 = mask[0].reshape(-1)
+        m1 = mask[1].reshape(-1)
+
+        self.assertFalse(bool(m0[0].item()))
+        self.assertFalse(bool(m0[1].item()))
+        for j in range(2, 9):
+            self.assertTrue(bool(m0[j].item()), f"entry 0 pos {j} should be unmasked")
+        for j in range(9):
+            self.assertTrue(bool(m1[j].item()), f"entry 1 pos {j} should be unmasked")
+
+    # -- is_trimmable ----------------------------------------------------
+
+    def test_is_trimmable(self):
+        batch = BatchTurboQuantKVCache([0, 0])
+        self.assertTrue(batch.is_trimmable())
+
+    # -- extract ---------------------------------------------------------
+
+    def test_extract(self):
+        """Extract returns per-sequence cache identical to original."""
+        c1 = self._make_tq_cache(10, seed=20)
+        c2 = self._make_tq_cache(15, seed=21)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        # Extract entry 0 (the shorter cache, left-padded by 5)
+        extracted = batch.extract(0)
+        self.assertIsInstance(extracted, TurboQuantKVCache)
+        self.assertEqual(extracted.size(), 10)
+
+        # Extract entry 1 (the longer cache, no padding)
+        extracted1 = batch.extract(1)
+        self.assertIsInstance(extracted1, TurboQuantKVCache)
+        self.assertEqual(extracted1.size(), 15)
+
+        # Dequantize and compare
+        mx.eval(extracted.k_packed, extracted.k_norms)
+        mx.eval(c1.k_packed, c1.k_norms)
+        # The extracted keys should match the original
+        self.assertTrue(
+            mx.allclose(
+                extracted.k_packed[..., :10, :],
+                c1.k_packed[..., :10, :],
+                atol=1e-5,
+            )
+        )
+
+    def test_extract_affine_v(self):
+        """Extract with affine-quantized V."""
+        c1 = self._make_tq_cache(10, v_bits=4, seed=20)
+        c2 = self._make_tq_cache(15, v_bits=4, seed=21)
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+
+        extracted = batch.extract(0)
+        self.assertIsInstance(extracted, TurboQuantKVCache)
+        self.assertEqual(extracted.size(), 10)
+        self.assertIsNotNone(extracted._v_quant)
+        self.assertTrue(
+            mx.array_equal(
+                extracted._v_quant[..., :10, :],
+                c1._v_quant[..., :10, :],
+            )
+        )
+
+    # -- merge correctness -----------------------------------------------
+
+    def test_merge_correctness(self):
+        """Merged cache dequantizes to same values as individual caches."""
+        mx.random.seed(42)
+        c1 = self._make_tq_cache(10, seed=100)
+        c2 = self._make_tq_cache(15, seed=101)
+
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        mx.eval(batch.k_packed, batch.k_norms, batch._idx)
+
+        # Dequantize the merged cache
+        k_merged, v_merged = batch._fetch_all()
+        mx.eval(k_merged, v_merged)
+
+        # Dequantize individual caches
+        k1, v1 = c1.dequantize()
+        k2, v2 = c2.dequantize()
+        mx.eval(k1, v1, k2, v2)
+
+        # Compare entry 0 (first batch entry)
+        k1_merged = k_merged[0, :, : c1.size(), :]
+        cos_k1 = mx.sum(k1.reshape(-1, 64) * k1_merged.reshape(-1, 64), axis=-1)
+        norms_k1 = mx.linalg.norm(k1.reshape(-1, 64), axis=-1) * mx.linalg.norm(
+            k1_merged.reshape(-1, 64), axis=-1
+        )
+        cs_k1 = mx.mean(cos_k1 / (norms_k1 + 1e-10))
+        mx.eval(cs_k1)
+        self.assertGreater(
+            cs_k1.item(), 0.999, f"Key cosine similarity for entry 0: {cs_k1.item()}"
+        )
+
+        cos_v1 = mx.sum(
+            v1.reshape(-1, 64) * v_merged[0, :, : c1.size(), :].reshape(-1, 64), axis=-1
+        )
+        norms_v1 = mx.linalg.norm(v1.reshape(-1, 64), axis=-1) * mx.linalg.norm(
+            v_merged[0, :, : c1.size(), :].reshape(-1, 64), axis=-1
+        )
+        cs_v1 = mx.mean(cos_v1 / (norms_v1 + 1e-10))
+        mx.eval(cs_v1)
+        self.assertGreater(
+            cs_v1.item(), 0.999, f"Value cosine similarity for entry 0: {cs_v1.item()}"
+        )
+
+        # Compare entry 1 (second batch entry)
+        k2_merged = k_merged[1, :, : c2.size(), :]
+        cos_k2 = mx.sum(k2.reshape(-1, 64) * k2_merged.reshape(-1, 64), axis=-1)
+        norms_k2 = mx.linalg.norm(k2.reshape(-1, 64), axis=-1) * mx.linalg.norm(
+            k2_merged.reshape(-1, 64), axis=-1
+        )
+        cs_k2 = mx.mean(cos_k2 / (norms_k2 + 1e-10))
+        mx.eval(cs_k2)
+        self.assertGreater(
+            cs_k2.item(), 0.999, f"Key cosine similarity for entry 1: {cs_k2.item()}"
+        )
+
+    def test_merge_correctness_affine_v(self):
+        """Merged cache dequantizes to same values with affine-quantized V."""
+        mx.random.seed(42)
+        c1 = self._make_tq_cache(10, v_bits=4, seed=100)
+        c2 = self._make_tq_cache(15, v_bits=4, seed=101)
+
+        batch = BatchTurboQuantKVCache.merge([c1, c2])
+        mx.eval(batch.k_packed, batch._idx)
+
+        # Dequantize individual caches
+        k1, v1 = c1.dequantize()
+        k2, v2 = c2.dequantize()
+        mx.eval(k1, v1, k2, v2)
+
+        # Dequantize merged cache
+        k_merged, v_merged = batch._fetch_all()
+        mx.eval(k_merged, v_merged)
+
+        # Compare entry 0 keys
+        k1_merged = k_merged[0, :, : c1.size(), :]
+        cos_k1 = mx.sum(k1.reshape(-1, 64) * k1_merged.reshape(-1, 64), axis=-1)
+        norms_k1 = mx.linalg.norm(k1.reshape(-1, 64), axis=-1) * mx.linalg.norm(
+            k1_merged.reshape(-1, 64), axis=-1
+        )
+        cs_k1 = mx.mean(cos_k1 / (norms_k1 + 1e-10))
+        mx.eval(cs_k1)
+        self.assertGreater(cs_k1.item(), 0.999)
+
+        # Compare entry 0 values
+        v1_merged = v_merged[0, :, : c1.size(), :]
+        cos_v1 = mx.sum(v1.reshape(-1, 64) * v1_merged.reshape(-1, 64), axis=-1)
+        norms_v1 = mx.linalg.norm(v1.reshape(-1, 64), axis=-1) * mx.linalg.norm(
+            v1_merged.reshape(-1, 64), axis=-1
+        )
+        cs_v1 = mx.mean(cos_v1 / (norms_v1 + 1e-10))
+        mx.eval(cs_v1)
+        self.assertGreater(cs_v1.item(), 0.999)
