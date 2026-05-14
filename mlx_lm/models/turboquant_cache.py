@@ -572,8 +572,8 @@ class BatchTurboQuantKVCache:
             if self.k_packed is not None:
                 new_kp = mx.zeros((B0, H0, n, self._k_pdim), dtype=mx.uint32)
                 new_kn = mx.zeros((B0, H0, n), dtype=mx.float32)
-                new_kp[..., :prev, :] = self.k_packed
-                new_kn[..., :prev] = self.k_norms
+                new_kp[..., :prev, :] = self.k_packed[..., :prev, :]
+                new_kn[..., :prev] = self.k_norms[..., :prev]
                 self.k_packed, self.k_norms = new_kp, new_kn
                 if self.v_bits is not None:
                     v_qdim = self._v_dim // (8 * mx.uint32.size // self.v_bits)
@@ -581,9 +581,9 @@ class BatchTurboQuantKVCache:
                     new_vq = mx.zeros((B0, H0, n, v_qdim), dtype=mx.uint32)
                     new_vs = mx.zeros((B0, H0, n, v_sdim), dtype=mx.float16)
                     new_vb = mx.zeros((B0, H0, n, v_sdim), dtype=mx.float16)
-                    new_vq[..., :prev, :] = self._v_quant
-                    new_vs[..., :prev, :] = self._v_scales
-                    new_vb[..., :prev, :] = self._v_biases
+                    new_vq[..., :prev, :] = self._v_quant[..., :prev, :]
+                    new_vs[..., :prev, :] = self._v_scales[..., :prev, :]
+                    new_vb[..., :prev, :] = self._v_biases[..., :prev, :]
                     self._v_quant, self._v_scales, self._v_biases = (
                         new_vq,
                         new_vs,
