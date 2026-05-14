@@ -1011,7 +1011,13 @@ class BatchTurboQuantKVCache:
             Bc = c.left_padding.shape[0]
             Hc = c.k_packed.shape[1] if c.k_packed is not None else 0
             left = max_idx - c._idx
-            right = 0  # No right padding needed — we're padding to max_idx
+            # Right padding ensures both caches have the same total size
+            # before concatenating on axis 0 (batch axis).
+            right = max_size - c._idx - left
+            if right < 0:
+                # Truncate if this cache is longer than max_size
+                # (shouldn't happen, but be safe)
+                right = 0
 
             def _pad_4d(arr, left_p, right_p):
                 if arr is None:
