@@ -174,10 +174,15 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
                 pre_offsets[i] = c.offset.tolist()
 
         # Multi-step decode: 3 tokens (batched, B=2)
+        # Must match the batch size of the merged cache — the real server
+        # always sends inputs with B matching the batched cache size.
         decode_tokens = self.tokenizer.encode(
             "hello world test", return_tensors="mlx",
         )[0]
-        decode_tokens = mx.expand_dims(decode_tokens, 0)
+        # Create B=2 batch: each entry gets the same decode tokens
+        decode_tokens = mx.concatenate(
+            [mx.expand_dims(decode_tokens, 0), mx.expand_dims(decode_tokens, 0)], axis=0
+        )
 
         out = self.model(decode_tokens, cache=batched)
         mx.eval(out)
@@ -271,19 +276,21 @@ class TestBatchTurboQuantKVCacheServerLifecycle(unittest.TestCase):
                     c.extend(new_tq[tq_idx])
                     tq_idx += 1
 
-        # Step 5: Filter to keep only entry 0 (only TQ layers)
+        # Step 5: Filter to keep only entry 0 (ALL layers, not just TQ)
+        # The SSM layers (ArraysCache) must also be filtered — otherwise
+        # they still have B=2 while the input is B=1, causing shape mismatch.
         for c in batched:
-            if isinstance(c, BatchTurboQuantKVCache):
+            if hasattr(c, "filter"):
                 c.filter(mx.array([0]))
 
-        # Verify only 1 entry remains in TQ layers
+        # Verify only 1 entry remains in all batchable layers
         for c in batched:
-            if isinstance(c, BatchTurboQuantKVCache):
+            if hasattr(c, "offset"):
                 self.assertEqual(c.offset.shape[0], 1)
 
-        # Step 6: Trim 1 token (only TQ layers)
+        # Step 6: Trim 1 token (all layers)
         for c in batched:
-            if isinstance(c, BatchTurboQuantKVCache):
+            if hasattr(c, "trim"):
                 c.trim(1)
 
         # Step 7: Decode 1 more token (single entry, B=1)
