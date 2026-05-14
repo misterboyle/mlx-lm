@@ -596,18 +596,38 @@ class BatchTurboQuantKVCache:
 
         # Write to padded positions
         for i in range(B):
-            pad = self.left_padding[i]
+            pad = int(self.left_padding[i])
             end = pad + S
-            self.k_packed[i, :, pad:end, :] = keys[i : i + 1, :, :, :]
-            self.k_norms[i, :, pad:end] = mx.reshape(
-                self._quantize_key(keys[i : i + 1, :, :, :]), (H, S)
-            )
+            key_slice = keys[i : i + 1, :, :, :]
+            # Quantize keys using PolarQuant (Hadamard rotation + codebook)
+            k_pk, k_nrm = self._quantize_key_packed(key_slice)
+            # Squeeze batch dim: k_pk is (1, H, S, k_pdim), target is (H, S, k_pdim)
+            self.k_packed[i, :, pad:end, :] = k_pk[0]
+            self.k_norms[i, :, pad:end] = k_nrm[0]
+
+            # Quantize values
+            val_slice = values[i : i + 1, :, :, :]
+            if self.v_bits is not None:
+                # Affine quantize values with mx.quantize
+                vq, vs, vb = mx.quantize(
+                    val_slice, group_size=self.v_group_size, bits=self.v_bits
+                )
+                self._v_quant[i, :, pad:end, :] = vq[0]
+                self._v_scales[i, :, pad:end, :] = vs[0]
+                self._v_biases[i, :, pad:end, :] = vb[0]
+            else:
+                # PolarQuant for values
+                v_pk, v_nrm = self._quantize_value_packed(val_slice)
+                self.v_packed[i, :, pad:end, :] = v_pk[0]
+                self.v_norms[i, :, pad:end] = v_nrm[0]
 
         self._idx += S
+        self.offset += S
         return self._fetch_all()
 
     def _quantize_key(self, keys):
-        """Quantize keys using PolarQuant (Hadamard rotation + codebook)."""
+        """Quantize keys using PolarQuant (Hadamard rotation + codebook).
+        Returns only the norms (k_nrm)."""
         from .turboquant_metal import fused_quantize
 
         B, H, S, k_dim = keys.shape
@@ -619,6 +639,36 @@ class BatchTurboQuantKVCache:
             self.quant_bits,
         )
         return k_nrm.reshape(B, H, S)
+
+    def _quantize_key_packed(self, keys):
+        """Quantize keys using PolarQuant. Returns (k_pk, k_nrm)."""
+        from .turboquant_metal import fused_quantize
+
+        B, H, S, k_dim = keys.shape
+        k_pk, k_nrm = fused_quantize(
+            keys.reshape(-1, k_dim),
+            self._get_k_signs(),
+            self._get_k_boundaries(),
+            k_dim,
+            self.quant_bits,
+        )
+        k_pk = k_pk.reshape(B, H, S, self._k_pdim)
+        return k_pk, k_nrm
+
+    def _quantize_value_packed(self, values):
+        """Quantize values using PolarQuant. Returns (v_pk, v_nrm)."""
+        from .turboquant_metal import fused_quantize
+
+        B, H, S, v_dim = values.shape
+        v_pk, v_nrm = fused_quantize(
+            values.reshape(-1, v_dim),
+            self._get_v_signs(),
+            self._get_v_boundaries(),
+            v_dim,
+            self.quant_bits,
+        )
+        v_pk = v_pk.reshape(B, H, S, self._v_pdim)
+        return v_pk, v_nrm
 
     def _get_k_signs(self):
         """Return key quantizer signs (stored from merge)."""
@@ -710,6 +760,10 @@ class BatchTurboQuantKVCache:
     def _get_v_signs(self):
         """Return value quantizer signs (stored from merge)."""
         return self._v_signs
+
+    def _get_v_boundaries(self):
+        """Return value quantizer centroids (stored from merge)."""
+        return self._v_centroids
 
     # ------------------------------------------------------------------
     # merge

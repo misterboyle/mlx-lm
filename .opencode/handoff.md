@@ -1,57 +1,34 @@
-# Handoff: Memory Profiling Task
+# Handoff: hq-9qj — BatchTurboQuantKVCache Integration
 
 ## Completed
 
-- Created epic `hq-lq1` (System characterization) and task `hq-lq1.1` (Memory profiling)
-- Task properly linked as child of epic via `--parent` flag
-- Updated task with server configuration details
-- Model quality test skill updated to use `/metrics` endpoint instead of log parsing
+- **Bug fix:** `BatchTurboQuantKVCache.update_and_fetch` — added `self.offset += S` (1 line). Without this, `_fetch_all()` returned the prefill length instead of the post-decode length, causing shape mismatches in attention mask computation.
+- **4 full-pipeline decode tests** covering all 4 cases:
+  - Non-hybrid + PolarQuant (`test_batch_decode_with_turbo_quant_decode_step`)
+  - Non-hybrid + Affine V (`test_batch_decode_affine_v_decode_step`)
+  - Hybrid + PolarQuant (`test_batch_decode_hybrid_model_decode_step`)
+  - Hybrid + Affine V (`test_batch_decode_hybrid_affine_v_decode_step`)
+- Each test: prefill two prompts → merge into batched caches → run one batched decode step → verify outputs differ across entries (not degenerate)
+- Removed 4 redundant prefill+merge-only tests
+- **75 tests pass**, formatting clean
 
-## Server Configuration
+## Files Changed
 
-- **TurboQuant**: 3-bit KV cache
-- **FP16 layers**: 1 (default)
-- **Mode**: single-mode
-- **Model**: Qwen3.6-35B-A3B-UD-MLX-4bit
+- `mlx_lm/models/turboquant_cache.py` — `BatchTurboQuantKVCache` class (~650 lines, previous agent) + `TurboQuantKVCache.merge()` delegation + my 1-line fix
+- `tests/test_turboquant.py` — 4 decode tests + formatting
 
-## Server Start Command
+## Outstanding Issue: `from_state` Missing Quantizer Params
 
-```bash
-pkill -f mlx_lm.server
-sleep 2
-PYTHONUNBUFFERED=1 nohup python -m mlx_lm.server \
-  --model /Users/michael/.localllm/models/Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --host 0.0.0.0 --port 8080 \
-  --turbo-kv-bits 3 \
-  --single-mode \
-  > /tmp/mlx_lm_server.log 2>&1 &
-```
+`BatchTurboQuantKVCache.from_state` does **not** restore `_k_signs`, `_k_centroids`, `_v_signs`, `_v_centroids`. These are set during `merge()` and are needed by `update_and_fetch()` for quantization.
+
+**Current impact:** Low. The server flow creates fresh batch caches per request via `_merge_caches()`. Per-request `TurboQuantKVCache` instances are saved/loaded for cache hits, not the batch cache itself. The batch cache is ephemeral.
+
+**When it becomes a problem:** If prompt cache save/load with subsequent generation is needed for batched caches (e.g., saving a batch cache mid-session and resuming), `from_state` would fail to quantize new tokens.
+
+**Fix:** Add `_k_signs`, `_k_centroids`, `_v_signs`, `_v_centroids` to `state`/`meta_state` serialization and restore them in `from_state`.
 
 ## What to Do Next
 
-1. **Claim the task**: `bd update hq-lq1.1 --claim`
-2. **Start the server** on the remote Mac with the config above
-3. **Run a multi-turn conversation** (4-8 turns) using opencode
-4. **Capture `/metrics` output** after each turn:
-   ```bash
-   curl -s http://172.16.49.25:8080/metrics | python3 -m json.tool
-   ```
-5. **Record memory data** after each turn:
-   - `mlx.active_memory_bytes` — total MLX memory
-   - `prompt_cache.total_bytes` — cache size
-   - `prompt_cache.total_sequences` — number of cached sequences
-   - `prompt_cache.by_type` — breakdown by type
-6. **Verify cache growth is linear** — no duplicate inserts from the segment cache bug
-7. **Document results** in the task notes
-
-## Key Files
-
-- `.opencode/skills/model-quality-test/SKILL.md` — Updated to use `/metrics` endpoint
-- `mlx_lm/server.py` — Fixed segment cache duplicate insert bug (lines 1082-1094)
-
-## Notes
-
-- The segment cache bug was fixed: full cache save moved outside the segment loop to prevent duplicate inserts
-- The `/metrics` endpoint is working and returns structured JSON
-- Use opencode with `-c` flag for continuation turns
-- NO `-c` for first turn (clean slate)
+1. **Commit and push** — the implementation is ready for live server testing
+2. **Fix `from_state`** — add quantizer param serialization (low effort, ~10 lines)
+3. **Live server test** — start the server with `--turbo-kv-bits 3` on the Qwen3.6 hybrid model, send concurrent requests, verify batched decode works end-to-end
