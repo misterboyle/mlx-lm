@@ -645,7 +645,7 @@ class BatchTurboQuantKVCache:
             k_pk, k_nrm = self._quantize_key_packed(key_slice)
             # Squeeze batch dim: k_pk is (1, H, S, k_pdim), target is (H, S, k_pdim)
             self.k_packed[i, :, pad:end, :] = k_pk[0]
-            self.k_norms[i, :, pad:end] = k_nrm[0]
+            self.k_norms[i, :, pad:end] = k_nrm.reshape(H, S)
 
             # Quantize values
             val_slice = values[i : i + 1, :, :, :]
@@ -661,7 +661,7 @@ class BatchTurboQuantKVCache:
                 # PolarQuant for values
                 v_pk, v_nrm = self._quantize_value_packed(val_slice)
                 self.v_packed[i, :, pad:end, :] = v_pk[0]
-                self.v_norms[i, :, pad:end] = v_nrm[0]
+                self.v_norms[i, :, pad:end] = v_nrm.reshape(H, S)
 
         self._idx += S
         self.offset += S
@@ -717,8 +717,8 @@ class BatchTurboQuantKVCache:
         return self._k_signs
 
     def _get_k_boundaries(self):
-        """Return key quantizer centroids (stored from merge)."""
-        return self._k_centroids
+        """Return key quantizer boundaries (midpoints between centroids)."""
+        return (self._k_centroids[:-1] + self._k_centroids[1:]) / 2.0
 
     def _fetch_all(self):
         """Return dequantized (keys, values) for the active range.
@@ -807,8 +807,8 @@ class BatchTurboQuantKVCache:
         return self._v_signs
 
     def _get_v_boundaries(self):
-        """Return value quantizer centroids (stored from merge)."""
-        return self._v_centroids
+        """Return value quantizer boundaries (midpoints between centroids)."""
+        return (self._v_centroids[:-1] + self._v_centroids[1:]) / 2.0
 
     # ------------------------------------------------------------------
     # merge
