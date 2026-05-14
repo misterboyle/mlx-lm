@@ -592,8 +592,8 @@ class BatchTurboQuantKVCache:
                 else:
                     new_vp = mx.zeros((B0, H0, n, self._v_pdim), dtype=mx.uint32)
                     new_vn = mx.zeros((B0, H0, n), dtype=mx.float32)
-                    new_vp[..., :prev, :] = self.v_packed
-                    new_vn[..., :prev] = self.v_norms
+                    new_vp[..., :prev, :] = self.v_packed[..., :prev, :]
+                    new_vn[..., :prev] = self.v_norms[..., :prev]
                     self.v_packed, self.v_norms = new_vp, new_vn
             else:
                 self.k_packed = mx.zeros((B, H, n, self._k_pdim), dtype=mx.uint32)
