@@ -458,6 +458,20 @@ class TurboQuantKVCache:
             )
         return k, v
 
+    def to_kvcache(self):
+        """Dequantize back to a standard KVCache for batch merge compatibility.
+
+        Used by the server's _maybe_dequantize_cache() to convert TurboQuant
+        caches to standard KVCache before batch merge operations.
+        """
+        from .cache import KVCache
+
+        kv = KVCache()
+        k, v = self.dequantize()
+        if k is not None:
+            kv.update_and_fetch(k, v)
+        return kv
+
     def copy(self):
         """Return a shallow copy with independent offset and invalidated decode buffers."""
         import copy as _copy

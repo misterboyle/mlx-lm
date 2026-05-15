@@ -51,10 +51,13 @@ from .utils import _parse_size, load, sharded_load
 
 
 def _maybe_dequantize_cache(cache):
-    """Convert MixedQuantKVCache entries back to KVCache for batch merge."""
+    """Convert quantized cache entries back to KVCache for batch merge."""
     from .models.mixed_quant_cache import MixedQuantKVCache
+    from .models.turboquant_cache import TurboQuantKVCache
     for i, c in enumerate(cache):
         if isinstance(c, MixedQuantKVCache):
+            cache[i] = c.to_kvcache()
+        elif isinstance(c, TurboQuantKVCache):
             cache[i] = c.to_kvcache()
     return cache
 
